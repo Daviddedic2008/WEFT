@@ -52,7 +52,7 @@ extern "C" __global__ void __raygen__corr_3d() {
 #endif
             params.out_hit_centroid[base + n] = (int)prim;
             params.out_hit_value[base + n]    = qn / t;
-            tmin = t * (1.0f + 1e-5f);     // strictly beyond this hit; ties closer than 1e-5 relative merge
+            tmin = nextafterf(t, 3.0e38f);  // the next representable distance: skips only exact ties
         }
         params.out_hit_count[logical_ray_id] = n;
         return;
