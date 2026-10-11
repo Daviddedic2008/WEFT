@@ -185,6 +185,9 @@ def fig_filtered(R, out):
 
 def fig_throughput(R, out):
     T = R["throughput"]
+    if "n_queries" not in T:          # only imported baselines, no throughput stage in this run
+        print("  skipping fig_throughput (no throughput stage in this run)")
+        return
     fig, ax = plt.subplots(figsize=(6.5, 3.4), layout="constrained")
     for e in ENGINES:
         k = f"{e}_sequential_qps"
