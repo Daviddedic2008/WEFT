@@ -14,6 +14,7 @@ Stages:
   test       selected configs on TEST, median of --repeats per query, 95% bootstrap CIs
   filtered   synthetic and own-domain filters via FastPLAID's `subset`, judged on the filtered GT
   throughput one batched search over --throughput_queries queries
+  table      rewrite comparison.md from saved results (no searching)
 Results: <results>/<dataset>/fastplaid_nbits<b>/results.json, plus a side-by-side table with
 the main run (--compare <results subdir>, e.g. v2_E256).
 
@@ -82,7 +83,13 @@ class FP:
 
     def open_index(self):
         if self.index is None:
-            self.index = self.fps.FastPlaid(index=self.args.index_dir, device="cuda:0")
+            kw = {} if self.args.index_gpu_memory == "default" else {"index_gpu_memory": self.args.index_gpu_memory}
+            try:
+                self.index = self.fps.FastPlaid(index=self.args.index_dir, device="cuda:0", **kw)
+            except TypeError:  # older fast-plaid without the placement option
+                print("  note: this fast-plaid has no index_gpu_memory option; using its default placement")
+                self.index = self.fps.FastPlaid(index=self.args.index_dir, device="cuda:0")
+            self.R["meta"]["index_gpu_memory"] = kw.get("index_gpu_memory", "default")
         return self.index
 
     # -------------------------------------------------------------- stages
@@ -179,8 +186,16 @@ class FP:
 
     def print_comparison(self):
         M = self.compare_results()
-        rows = ["| target | FastPLAID | RAGRT (RT) | RAGRT (CUDA-core Stage 1) | PLAID+TMS | PLAID |", "|---|---|---|---|---|---|"]
-        f = lambda r: f"{r['lat']['median']:.2f} ms ({r['gt_r10']['mean']:.3f})" if r else "unreachable"
+        om = {"success@5": "S@5", "mrr@10": "MRR@10"}.get(str(self.ds["official_metric"]).lower(), self.ds["official_metric"])
+        rows = [f"Cells: median latency (exact R@10 / {om} vs qrels), TEST split, one query at a time.", "",
+                "| target | FastPLAID | RAGRT (RT) | RAGRT (CUDA-core Stage 1) | PLAID+TMS | PLAID |", "|---|---|---|---|---|---|"]
+
+        def f(r):
+            if not r:
+                return "unreachable"
+            off = r.get("official", {}).get("mean")
+            return f"{r['lat']['median']:.2f} ms ({r['gt_r10']['mean']:.3f} / {off:.3f})" if off is not None else \
+                   f"{r['lat']['median']:.2f} ms ({r['gt_r10']['mean']:.3f})"
         for name, s in self.R["selection"].items():
             mine = self.R["test"].get(f"fastplaid|{s['fastplaid']['key']}") if s["fastplaid"] else None
             cells = []
@@ -196,8 +211,10 @@ class FP:
         pred = np.load(self.ds["predicates_path"]).astype(np.uint32)
         masks = dict(("syn" + l.rstrip("%"), b) for l, b in C.SYNTHETIC_MASKS)
         qids = self.test[:self.args.max_filter_queries]
-        sel = self.R["selection"][self.primary()]["fastplaid"]
+        name = self.primary()
+        sel = self.R["selection"][name]["fastplaid"]
         out = self.R.setdefault("filtered", {})
+        self.R["filtered_target"] = name
         for filt in [g for g in self.gt_names if g != "all"]:
             if filt == "own_domain":
                 lists = {d: np.flatnonzero(pred & np.uint32(1 << (C.DOMAIN_BIT_BASE + i))).tolist()
@@ -210,11 +227,21 @@ class FP:
             out[filt] = summarize(lat, r10, r100, off)
             print(f"    filter {filt:<10} {out[filt]['lat']['median']:.2f} ms  R@10 {out[filt]['gt_r10']['mean']:.3f}", flush=True)
 
+    def stage_table(self):
+        self.print_comparison()
+
     def primary(self):
+        """The main run's primary target if FastPLAID reaches it, else the highest target it reaches."""
+        sel = self.R["selection"]
         M = self.compare_results()
-        if M and M.get("primary_target") in self.R["selection"]:
+        if M and sel.get(M.get("primary_target"), {}).get("fastplaid"):
             return M["primary_target"]
-        return next(n for n, s in self.R["selection"].items() if s["fastplaid"])
+        reach = [(s["target_gt_r10"], n) for n, s in sel.items() if s["fastplaid"]]
+        if not reach:
+            sys.exit("FATAL: FastPLAID reaches none of the targets")
+        name = max(reach)[1]
+        print(f"  using {name} (the main run's primary target is unreachable for FastPLAID)")
+        return name
 
     def stage_throughput(self):
         idx = self.open_index()
@@ -225,7 +252,10 @@ class FP:
         idx.search(queries_embeddings=qs, top_k=C.TOP_K, show_progress=False, **p)
         torch.cuda.synchronize()
         self.R["throughput"] = {"n_queries": len(qs), "batched_qps": len(qs) / (time.perf_counter() - t0), "params": p}
-        print(f"  throughput {self.R['throughput']['batched_qps']:.0f} queries/s (one batched call)", flush=True)
+        print(f"  throughput {self.R['throughput']['batched_qps']:.0f} queries/s (one batched call, {key(p)})", flush=True)
+        M = self.compare_results() or {}
+        if "throughput" in M:
+            print(f"  main run throughput section: {json.dumps(M['throughput'])[:400]}")
 
 
 def main():
@@ -241,6 +271,8 @@ def main():
     ap.add_argument("--max_filter_queries", type=int, default=2000)
     ap.add_argument("--throughput_queries", type=int, default=1024)
     ap.add_argument("--targets", type=lambda s: [float(x) for x in s.split(",")], default=[0.80, 0.85, 0.90, 0.95, 0.98])
+    ap.add_argument("--index_gpu_memory", default="high", choices=["high", "auto", "medium", "low", "default"],
+                    help="FastPLAID placement of codes/residuals at query time; 'high' keeps both on the GPU")
     ap.add_argument("--compare", default=None, help="results subdir of the main run to compare against, e.g. v2_E256")
     args = ap.parse_args()
     b = FP(args)
