@@ -5,6 +5,9 @@ The three retrieval engines behind one interface, for benchmarks and profiling.
   ptms   : PLAID stages 1-3, then fused TileMaxSim rerank
   ragrt  : RT-core candidate generation + fused TileMaxSim rerank
   ragrt_bf : identical pipeline, but Stage 1 runs on CUDA cores: the no-RT ablation.
+  ragrt_nofilter : codebook-filter ablation: Stage 1 returns every codeword, so Stage 2
+             fetches every list of each probed centroid (plain centroid probing on the same
+             index and kernels). Grid parameter eids = "all".
              polar geometry: the same threshold query as a linear scan (identical hits);
              fan geometry: exact top-k codewords per token and subspace.
 
@@ -52,7 +55,8 @@ def ragrt_cfg_key(p):
     return f"nc={p['nc']} eids={p['eids']} ndocs={p['ndocs']}"
 
 
-RAGRT_ENGINES = ("ragrt", "ragrt_bf")
+RAGRT_ENGINES = ("ragrt", "ragrt_bf", "ragrt_nofilter")
+STAGE1_MODE = {"ragrt": 0, "ragrt_bf": 1, "ragrt_nofilter": 2}   # see CorrIndex3D.set_stage1_mode
 
 
 def cfg_key(engine, p):
@@ -252,6 +256,16 @@ class Engines:
         Q_sub, scores, topc = self.ragrt_prep(Qf, ntok, p["nc"])
         return self.index.candidates(Q_sub, topc, scores, p["nc"], self.ndocs(p), mask, p["eids"])
 
+    def use_engine(self, engine):
+        """Set Stage 1 for a RAGRT engine (ragrt, ragrt_bf, ragrt_nofilter)."""
+        self.index.set_stage1_mode(STAGE1_MODE[engine])
+
+    def resolve(self, engine, p):
+        """ragrt_nofilter's eids = "all" means every codeword of the index."""
+        if p.get("eids") == "all":
+            p = dict(p, eids=self.E)
+        return p
+
     def stage1(self, brute_force):
         """Select Stage 1: RT cores (False) or the CUDA-core ablation (True)."""
         self.index.set_stage1_mode(1 if brute_force else 0)
@@ -300,11 +314,11 @@ class Engines:
         if engine == "ptms":
             return self.ptms(Qf, p, mask)
         if engine in RAGRT_ENGINES:
-            self.stage1(engine == "ragrt_bf")
+            self.use_engine(engine)
             try:
-                return self.ragrt(Qf, ntok, p, mask)
+                return self.ragrt(Qf, ntok, self.resolve(engine, p), mask)
             finally:
-                self.stage1(False)
+                self.use_engine("ragrt")
         raise ValueError(engine)
 
 

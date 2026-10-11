@@ -32,7 +32,7 @@ DOCS = torch.tensor(RNG.normal(size=(N_DOCS, DIM)), dtype=torch.float32)
 
 
 def cfg_key(engine, p):
-    return (f"nc={p['nc']} eids={p['eids']} ndocs={p['ndocs']}" if engine in ("ragrt", "ragrt_bf")
+    return (f"nc={p['nc']} eids={p['eids']} ndocs={p['ndocs']}" if engine in ("ragrt", "ragrt_bf", "ragrt_nofilter")
             else f"nc={p['ncells']} th={p['threshold']} ndocs={p['ndocs']}")
 
 
@@ -89,6 +89,12 @@ class FakeEngines:
     def stage1(self, brute_force):
         self.bf = brute_force
 
+    def use_engine(self, engine):
+        self.engine = engine
+
+    def resolve(self, engine, p):
+        return dict(p, eids=256) if p.get("eids") == "all" else p
+
     def ragrt(self, Qf, ntok, p, mask=0):
         if _stats["on"]:
             _stats["v"]["rays"] += 32 * ntok
@@ -103,7 +109,7 @@ class FakeEngines:
 
 
 eng_mod = types.ModuleType("engines")
-eng_mod.Engines, eng_mod.cfg_key, eng_mod.RAGRT_ENGINES = FakeEngines, cfg_key, ("ragrt", "ragrt_bf")
+eng_mod.Engines, eng_mod.cfg_key, eng_mod.RAGRT_ENGINES = FakeEngines, cfg_key, ("ragrt", "ragrt_bf", "ragrt_nofilter")
 sys.modules["engines"] = eng_mod
 
 import eval_config as C
@@ -140,15 +146,16 @@ def main():
                 "--repeats", "1", "--max_filter_queries", "40", "--throughput_queries", "32", "--targets", "0.5,0.9"]
     run_benchmarks.main()
     # second invocation: only the no-RT engine, merged into the same results
-    sys.argv = ["run_benchmarks.py", "--dataset", "msmarco", "--quick", "--tune_size", "60", "--engines", "ragrt_bf",
+    sys.argv = ["run_benchmarks.py", "--dataset", "msmarco", "--quick", "--tune_size", "60", "--engines", "ragrt_bf,ragrt_nofilter",
                 "--stages", "sweep,select,test,breakdown,filtered,throughput,drops",
                 "--repeats", "1", "--max_filter_queries", "40", "--throughput_queries", "32", "--targets", "0.5,0.9"]
     run_benchmarks.main()
     R = json.load(open(os.path.join(os.environ["RAGRT_RESULTS"], "msmarco", "results.json")))
-    assert set(R["sweep"]) == {"plaid", "ptms", "ragrt", "ragrt_bf"}, R["sweep"].keys()
-    assert {"plaid", "ptms", "ragrt", "ragrt_bf"} <= set(R["breakdown"]), R["breakdown"].keys()
+    assert set(R["sweep"]) == {"plaid", "ptms", "ragrt", "ragrt_bf", "ragrt_nofilter"}, R["sweep"].keys()
+    assert "speedup_vs_ragrt_nofilter" in R["comparisons"]["plaid_default"]
+    assert {"plaid", "ptms", "ragrt", "ragrt_bf", "ragrt_nofilter"} <= set(R["breakdown"]), R["breakdown"].keys()
     assert "speedup_vs_ragrt_bf" in R["comparisons"]["plaid_default"]
-    assert all(set(v) == {"plaid", "ptms", "ragrt", "ragrt_bf"} for v in R["filtered"].values())
+    assert all(set(v) == {"plaid", "ptms", "ragrt", "ragrt_bf", "ragrt_nofilter"} for v in R["filtered"].values())
     assert R["split"]["tune"] == 60 and R["split"]["test"] == R["split"]["total_with_gt"] - 60
     assert "plaid_default" in R["selection"] and R["primary_target"] == "plaid_default"
     for k, v in R["test"].items():
@@ -168,7 +175,7 @@ def main():
     last = FakeEngines.calls[-1]
     assert last["geometry"] == "fan" and last["stage3"] == "dense" and last["rerank"] == "simt" and last["load_ragrt"]
     R2 = json.load(open(os.path.join(src, "E1024", "results.json")))
-    assert set(R2["sweep"]) == {"plaid", "ptms", "ragrt", "ragrt_bf"}
+    assert set(R2["sweep"]) == {"plaid", "ptms", "ragrt", "ragrt_bf"}, R2["sweep"].keys()
     assert R2["sweep"]["plaid"] == R["sweep"]["plaid"], "plaid sweep must be imported unchanged"
     assert R2["meta"]["baselines_from"]["engines"] == ["plaid", "ptms"]
     assert R2["meta"]["ragrt"]["calibrated_on"] == 60

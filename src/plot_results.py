@@ -23,8 +23,9 @@ STYLE = {
     "plaid": {"color": "#eb6834", "marker": "s", "label": "PLAID"},
     "ptms":  {"color": "#1baf7a", "marker": "D", "label": "PLAID+TMS"},
     "ragrt_bf": {"color": "#eda100", "marker": "^", "label": "RAGRT, no RT (CUDA-core Stage 1)"},
+    "ragrt_nofilter": {"color": "#8c564b", "marker": "v", "label": "RAGRT, codebook filter off"},
 }
-ALL_ENGINES = ["plaid", "ptms", "ragrt", "ragrt_bf"]
+ALL_ENGINES = ["plaid", "ptms", "ragrt", "ragrt_bf", "ragrt_nofilter"]
 ENGINES = ALL_ENGINES          # narrowed in main() to the engines present in results.json
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 
@@ -242,14 +243,15 @@ def summary_md(R, out, metric_name):
                      f"{t['lat']['p99']:.2f} | {ci('gt_r10')} | {ci('official')} |")
     L += ["", "## RAGRT vs baselines at each target", "",
           "| target | speedup vs PLAID | speedup vs PLAID+TMS | exact R@10 diff vs PLAID+TMS | "
-          f"{metric_name} diff vs PLAID+TMS | RT vs no-RT speedup | exact R@10 diff vs no-RT |",
-          "|---|---|---|---|---|---|---|"]
+          f"{metric_name} diff vs PLAID+TMS | RT vs no-RT speedup | exact R@10 diff vs no-RT | "
+          "vs codebook filter off: speedup | exact R@10 diff |",
+          "|---|---|---|---|---|---|---|---|---|"]
     for name, c in R.get("comparisons", {}).items():
         f = lambda k: f"{c[k]['mean']:+.4f} [{c[k]['ci95'][0]:+.4f}, {c[k]['ci95'][1]:+.4f}]" if k in c else "n/a"
         sp = lambda k: f"{c[k]:.2f}x" if k in c else "n/a"
         L.append(f"| {name} | {sp('speedup_vs_plaid')} | {sp('speedup_vs_ptms')} | "
                  f"{f('gt_r10_diff_vs_ptms')} | {f('official_diff_vs_ptms')} | {sp('speedup_vs_ragrt_bf')} | "
-                 f"{f('gt_r10_diff_vs_ragrt_bf')} |")
+                 f"{f('gt_r10_diff_vs_ragrt_bf')} | {sp('speedup_vs_ragrt_nofilter')} | {f('gt_r10_diff_vs_ragrt_nofilter')} |")
     if "drops" in R:
         L += ["", "## RAGRT stage counters (diagnostic pass, counters off during timing)", "",
               "| config | stage-1 hits/ray | rays short of k | rays over hit cap | tasks dropped (MAX_TASKS) | "

@@ -41,7 +41,8 @@ from engines import Engines, cfg_key, RAGRT_ENGINES
 import rtrag_corr_3d
 
 CORE = ["plaid", "ptms", "ragrt"]          # the primary operating point must be reachable by these
-ENGINES = CORE + ["ragrt_bf"]              # ragrt_bf: no-RT ablation (brute-force Stage 1)
+ENGINES = CORE + ["ragrt_bf", "ragrt_nofilter"]   # ablations: no-RT Stage 1; codebook filter off
+DEFAULT_ENGINES = CORE + ["ragrt_bf"]
 PLAID_DEFAULT_K100 = {"ncells": 2, "threshold": 0.45, "ndocs": 1024}   # ColBERT Searcher defaults for k=100
 
 PLAID_GRID = [{"ncells": n, "threshold": t, "ndocs": d}
@@ -51,6 +52,9 @@ RAGRT_GRID = [{"nc": n, "eids": e, "ndocs": d}
               for n in [4, 8, 16, 32, 64] for e in [4, 8, 16, 32, 64, 128]
               for d in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]]   # eids <= 128 (kernel limit)
 QUICK_PLAID = [PLAID_DEFAULT_K100, {"ncells": 1, "threshold": 0.5, "ndocs": 256}]
+NOFILTER_GRID = [{"nc": n, "eids": "all", "ndocs": d}
+                 for n in [1, 2, 4, 8, 16, 32, 64]
+                 for d in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]]
 QUICK_RAGRT = [{"nc": 32, "eids": 16, "ndocs": 4096}, {"nc": 16, "eids": 32, "ndocs": 16384}]
 BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 WARMUP = 5
@@ -200,7 +204,8 @@ class Bench:
     def stage_sweep(self):
         plaid_grid = QUICK_PLAID if self.args.quick else PLAID_GRID
         ragrt_grid = QUICK_RAGRT if self.args.quick else RAGRT_GRID
-        grids = {"plaid": plaid_grid, "ptms": plaid_grid, "ragrt": ragrt_grid, "ragrt_bf": ragrt_grid}
+        grids = {"plaid": plaid_grid, "ptms": plaid_grid, "ragrt": ragrt_grid, "ragrt_bf": ragrt_grid,
+                 "ragrt_nofilter": NOFILTER_GRID[:2] if self.args.quick else NOFILTER_GRID}
         if PLAID_DEFAULT_K100 not in grids["plaid"]:
             grids["plaid"] = grids["plaid"] + [PLAID_DEFAULT_K100]
         sweep = self.R.setdefault("sweep", {})
@@ -280,7 +285,7 @@ class Bench:
                     c[engine] = test[f"{engine}|{s[engine]['key']}"]
             if "ragrt" in c:
                 rk = f"ragrt|{s['ragrt']['key']}"
-                for base in ("plaid", "ptms", "ragrt_bf"):
+                for base in ("plaid", "ptms", "ragrt_bf", "ragrt_nofilter"):
                     if base in c:
                         bk = f"{base}|{s[base]['key']}"
                         c[f"speedup_vs_{base}"] = c[base]["lat"]["median"] / c["ragrt"]["lat"]["median"]
@@ -331,18 +336,19 @@ class Bench:
         for e in RAGRT_ENGINES:
             if e not in P:
                 continue
-            eng.stage1(e == "ragrt_bf")
+            eng.use_engine(e)
+            pe = eng.resolve(e, P[e])
             try:
                 st, tot = [], []
                 for q in qids[:WARMUP]:
-                    eng.ragrt_profiled(*self.bank[q], P[e])
+                    eng.ragrt_profiled(*self.bank[q], pe)
                 for q in qids:
                     torch.cuda.synchronize(); t0 = time.perf_counter()
-                    _, s = eng.ragrt_profiled(*self.bank[q], P[e])
+                    _, s = eng.ragrt_profiled(*self.bank[q], pe)
                     tot.append((time.perf_counter() - t0) * 1000)
                     st.append(s)
             finally:
-                eng.stage1(False)
+                eng.use_engine("ragrt")
             st = np.array(st)
             names = ["s0b_prep", "s1_rt", "s2_gather", "s3_score", "s4_tms"]
             out[e] = {n: float(np.median(st[:, i])) for i, n in enumerate(names)}
@@ -384,17 +390,18 @@ class Bench:
         for e in RAGRT_ENGINES:
             if e not in P:
                 continue
-            self.eng.stage1(e == "ragrt_bf")
+            self.eng.use_engine(e)
+            pe = self.eng.resolve(e, P[e])
             try:
                 out[f"{e}_pipelined_qps"] = {}
                 for B in BATCH_SIZES:
-                    def run(batch, B=B, e=e):
+                    def run(batch, B=B, pe=pe):
                         for a in range(0, len(batch), B):
                             chunk = batch[a:a + B]
-                            self.eng.ragrt_pipelined([x[0] for x in chunk], [x[1] for x in chunk], P[e])
+                            self.eng.ragrt_pipelined([x[0] for x in chunk], [x[1] for x in chunk], pe)
                     out[f"{e}_pipelined_qps"][str(B)] = timed(run)
             finally:
-                self.eng.stage1(False)
+                self.eng.use_engine("ragrt")
         print(f"  throughput: {json.dumps(out)}", flush=True)
 
     def stage_drops(self):
@@ -438,7 +445,7 @@ def main():
     ap.add_argument("--throughput_queries", type=int, default=1024)
     ap.add_argument("--targets", type=lambda s: [float(x) for x in s.split(",")], default=[0.80, 0.85, 0.90, 0.95, 0.98])
     ap.add_argument("--quick", action="store_true", help="tiny grids, for a smoke test")
-    ap.add_argument("--engines", type=lambda s: s.split(","), default=ENGINES,
+    ap.add_argument("--engines", type=lambda s: s.split(","), default=DEFAULT_ENGINES,
                     help="subset to run (results merge into an existing results.json), e.g. ragrt_bf")
     ap.add_argument("--gt_path", default=None, help="ground truth file (default: the full one for the dataset)")
     ap.add_argument("--results_subdir", default=None, help="write results to <results>/<dataset>/<subdir> (e.g. smoke)")

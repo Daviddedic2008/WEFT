@@ -45,6 +45,8 @@ extern "C" void launch_bruteforce_stage1(const float* d_q_points, const float* d
 extern "C" void launch_threshold_stage1(const float* d_q_points, const float* d_codewords, const float* d_tau,
                                         int total_rays, int E, int max_hits, int* d_out_c, float* d_out_v,
                                         int* d_out_n, cudaStream_t stream);
+extern "C" void launch_all_codewords_stage1(const float* d_q_points, const float* d_codewords, int total_rays, int E,
+                                            int max_hits, int* d_out_c, float* d_out_v, int* d_out_n, cudaStream_t stream);
 extern "C" void ragrt_stage2(const int* d_out_c, const float* d_out_v, const int* d_out_hit_count,
                              const int* d_topc, const float* d_scores,
                              int total_rays, int max_hits, int k_eids, int k_cent, int ntok, int num_centroids,
@@ -111,7 +113,8 @@ public:
     float* d_level_tau = nullptr;               // [L * 32]
 
     int geometry = GEOM_FAN;
-    int stage1_mode = 0;    // 0: OptiX RT cores, 1: CUDA cores (fan: exact top-k, polar: threshold scan)
+    int stage1_mode = 0;    // 0: OptiX RT cores, 1: CUDA cores (fan: exact top-k, polar: threshold scan),
+                            // 2: every codeword (ablation: codebook filter off)
     int stage3_sparse = 1;
 
     // Buffers
@@ -403,10 +406,11 @@ public:
     // Stage-1 hit ids are norm-sorted primitive indices (mapped to eids in Stage 2) when they come
     // from the polar scene or its threshold-scan twin; the fan scene and the exact top-k scan give eids.
     bool hits_are_prims() const {
+        if (stage1_mode == 2) return false;
         return geometry == GEOM_POLAR || (geometry == GEOM_POLAR_ITER && stage1_mode == 0);
     }
     void set_stage1_mode(int mode) {
-        TORCH_CHECK(mode == 0 || mode == 1, "stage1 mode must be 0 (RT) or 1 (CUDA cores)");
+        TORCH_CHECK(mode >= 0 && mode <= 2, "stage1 mode must be 0 (RT), 1 (CUDA cores) or 2 (all codewords)");
         stage1_mode = mode;
     }
     void set_stage3_sparse(bool on) { stage3_sparse = on ? 1 : 0; }
@@ -491,7 +495,11 @@ public:
     // d_params: device copy of p (only read for the RT path).
     void run_stage1(const CorrParams3D& p, CUdeviceptr d_params, const float* qp, int total_rays, int k_eids,
                     int level, cudaStream_t stream) {
-        if (stage1_mode == 0) {
+        if (stage1_mode == 2) {
+            TORCH_CHECK(E <= p.max_hits, "all-codewords mode needs E <= ", p.max_hits, " (use a polar geometry, E <= 256)");
+            launch_all_codewords_stage1(qp, (const float*)d_centroid_xyz, total_rays, E, p.max_hits,
+                                        p.out_hit_centroid, p.out_hit_value, p.out_hit_count, stream);
+        } else if (stage1_mode == 0) {
             OPTIX_CHECK(optixLaunch(pipe, stream, d_params, sizeof(CorrParams3D), &sbt, total_rays, 1, 1));
         } else if (geometry == GEOM_POLAR) {
             // Same threshold over the norm-sorted codebook, so it also returns primitive indices.
@@ -563,7 +571,7 @@ public:
         TORCH_CHECK(Q_sub3d.dim() == 3 && Q_sub3d.size(1) == NUM_3D_SUBSPACES && Q_sub3d.size(2) == 3, "Q_sub3d must be [ntok, 32, 3]");
         TORCH_CHECK(Q_sub3d.size(0) >= 1 && Q_sub3d.size(0) <= 32, "1..32 query tokens");
         TORCH_CHECK(k_candidates >= 1 && k_candidates <= b_num_passages, "bad k_candidates");
-        TORCH_CHECK(k_eids >= 1 && k_eids <= 128, "k_eids must be in [1, 128]");
+        TORCH_CHECK(k_eids >= 1 && k_eids <= 256, "k_eids must be in [1, 256]");
         ensure_cand_capacity(k_candidates);
     }
 
@@ -720,7 +728,7 @@ public:
         pybind11::dict d;
         d["num_entries"] = E;
         d["geometry"] = geometry == GEOM_POLAR ? "polar" : (geometry == GEOM_POLAR_ITER ? "polar_iter" : "fan");
-        d["stage1"] = stage1_mode == 0 ? "rt" : "cuda_cores";
+        d["stage1"] = stage1_mode == 0 ? "rt" : (stage1_mode == 1 ? "cuda_cores" : "all_codewords");
         d["stage3"] = stage3_sparse ? "sparse" : "dense";
         d["rerank"] = ragrt_get_rerank_mode() == 1 ? "wmma" : "simt";
         d["eid_bytes"] = b_eid_bytes;

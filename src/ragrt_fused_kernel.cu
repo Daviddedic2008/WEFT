@@ -27,7 +27,7 @@ namespace rcub = ::ragrt_cub::cub;
 #define MIN_BASE_SCORE 0.0f
 #define WARPS_PER_BLOCK 8
 #define S2_MAX_HITS 256     // must be >= any max_hits passed in (MAX_HITS_CAP)
-#define S2_MAX_EIDS 128
+#define S2_MAX_EIDS 256     // codewords kept per ray (256 = all of an E=256 codebook)
 
 // Diagnostic counters (cumulative until reset; only written when stats are enabled,
 // so timed runs are unaffected). Index meaning, also mirrored in ragrt_drop_stats():
@@ -120,10 +120,19 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
     __syncwarp();
 
     // 2. Top-k by repeated warp argmax; duplicates of the winner (shared triangle edges,
-    //    repeated any-hit calls) are removed with it.
+    //    repeated any-hit calls) are removed with it. When every hit is kept there is
+    //    nothing to select: copy them (duplicates only repeat a lookup; Stage 3 takes a max).
     int nsel = 0;
     int nchunks = (n_hits + 31) / 32;
-    for (int r = 0; r < want; ++r) {
+    if (want == n_hits) {
+        for (int i = lane_id; i < n_hits; i += 32) {
+            s_top_eid[warp_in_block][i] = s_hits_eid[warp_in_block][i];
+            s_top_val[warp_in_block][i] = s_hits_val[warp_in_block][i];
+        }
+        nsel = n_hits;
+        __syncwarp();
+    }
+    for (int r = (want == n_hits) ? want : 0; r < want; ++r) {
         float my_best_v = -1e30f;
         int   my_best_i = -1;
         for (int chunk = 0; chunk < nchunks; ++chunk) {
@@ -480,6 +489,31 @@ extern "C" void launch_bruteforce_stage1(
     int blocks = (total_rays * 32 + threads - 1) / threads;
     bruteforce_stage1_kernel<<<blocks, threads, 0, stream>>>(
         d_q_points, d_codewords, total_rays, E, k, max_hits, d_out_c, d_out_v, d_out_n);
+}
+
+// (c) every codeword (ablation "codebook filter off"): Stage 2 then fetches every list of
+//     each probed centroid. Requires E <= max_hits.
+__global__ void all_codewords_stage1_kernel(
+    const float* __restrict__ q_points, const float* __restrict__ codewords,
+    int E, int max_hits, int* __restrict__ out_c, float* __restrict__ out_v, int* __restrict__ out_n
+) {
+    int ray = blockIdx.x;
+    int s = ray % NUM_3D_SUBSPACES;
+    float qx = q_points[3 * ray], qy = q_points[3 * ray + 1], qz = q_points[3 * ray + 2];
+    const float* cw = codewords + (size_t)3 * s * E;
+    size_t base = (size_t)ray * max_hits;
+    for (int e = threadIdx.x; e < E; e += blockDim.x) {
+        out_c[base + e] = e;
+        out_v[base + e] = qx * cw[3 * e] + qy * cw[3 * e + 1] + qz * cw[3 * e + 2];
+    }
+    if (threadIdx.x == 0) out_n[ray] = E;
+}
+
+extern "C" void launch_all_codewords_stage1(
+    const float* d_q_points, const float* d_codewords, int total_rays, int E, int max_hits,
+    int* d_out_c, float* d_out_v, int* d_out_n, cudaStream_t stream
+) {
+    all_codewords_stage1_kernel<<<total_rays, 128, 0, stream>>>(d_q_points, d_codewords, E, max_hits, d_out_c, d_out_v, d_out_n);
 }
 
 #define BFT_WARPS 8
