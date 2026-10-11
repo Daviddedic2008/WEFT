@@ -10,6 +10,15 @@ The three retrieval engines behind one interface, for benchmarks and profiling.
              index and kernels). Grid parameter eids = "all".
              polar geometry: the same threshold query as a linear scan (identical hits);
              fan geometry: exact top-k codewords per token and subspace.
+  ragrt_centroid : codeword-score ablation: same lists as ragrt_bf (CUDA-core Stage 1, top
+             eids codewords), but each posting is scored q.c only (no q_s.w term). ragrt_bf vs
+             this isolates what the codeword term adds to the approximate score.
+  ragrt_ivf : plain IVF on the RAGRT engine: q.c scoring, every list fetched. Meant for a
+             plain-IVF index (build_plain_ivf.py: one list per centroid, deduplicated pids),
+             so it is PLAID's candidate generation (centroid interaction) run on RAGRT's
+             kernels. ptms vs this isolates the engine; this vs ragrt_bf isolates the codebooks.
+  muvera   : MUVERA fixed-dimensional encodings (build_muvera_fde.py), exact GPU inner
+             product over all passages, then the same TileMaxSim rerank. Grid: cands.
 
 RAGRT options (Engines(..., geometry=, stage3=, rerank=, rt_quantile=)):
   geometry  "polar" (default): exact-threshold scene, one triangle per codeword in the
@@ -55,12 +64,23 @@ def ragrt_cfg_key(p):
     return f"nc={p['nc']} eids={p['eids']} ndocs={p['ndocs']}"
 
 
-RAGRT_ENGINES = ("ragrt", "ragrt_bf", "ragrt_nofilter")
-STAGE1_MODE = {"ragrt": 0, "ragrt_bf": 1, "ragrt_nofilter": 2}   # see CorrIndex3D.set_stage1_mode
+RAGRT_ENGINES = ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf")
+STAGE1_MODE = {"ragrt": 0, "ragrt_bf": 1, "ragrt_nofilter": 2,      # see CorrIndex3D.set_stage1_mode
+               "ragrt_centroid": 1, "ragrt_ivf": 2}
+CODEWORD_WEIGHT = {"ragrt": 1.0, "ragrt_bf": 1.0, "ragrt_nofilter": 1.0,   # weight of q_s.w in Stage 2
+                   "ragrt_centroid": 0.0, "ragrt_ivf": 0.0}
+
+
+def muvera_cfg_key(p):
+    return f"cands={p['cands']}"
 
 
 def cfg_key(engine, p):
-    return ragrt_cfg_key(p) if engine in RAGRT_ENGINES else plaid_cfg_key(p)
+    if engine in RAGRT_ENGINES:
+        return ragrt_cfg_key(p)
+    if engine == "muvera":
+        return muvera_cfg_key(p)
+    return plaid_cfg_key(p)
 
 
 RT_LEVELS = (4, 8, 16, 32, 64, 128)     # k_eids values the polar scene is calibrated for
@@ -68,7 +88,7 @@ RT_LEVELS = (4, 8, 16, 32, 64, 128)     # k_eids values the polar scene is calib
 
 class Engines:
     def __init__(self, ds, load_ragrt=True, geometry="polar", stage3="sparse", rerank="wmma",
-                 rt_quantile=0.05, rt_levels=RT_LEVELS):
+                 rt_quantile=0.05, rt_levels=RT_LEVELS, muvera_dir=None):
         assert geometry in ("polar", "polar_iter", "fan") and stage3 in ("sparse", "dense") and rerank in ("wmma", "simt")
         self.ds = ds
         self.geometry, self.stage3, self.rerank, self.rt_quantile = geometry, stage3, rerank, rt_quantile
@@ -99,6 +119,9 @@ class Engines:
         self.index = None
         if load_ragrt:
             self._load_ragrt()
+        self.muvera = None
+        if muvera_dir:
+            self._load_muvera(muvera_dir)
 
     # ------------------------------------------------------------------ setup
     def _load_ragrt(self):
@@ -126,6 +149,17 @@ class Engines:
             self.doc_offsets[:self.N + 1], self.doclens[:self.N], self.codes, self.residuals,
             self.centroids_fp16, self.bucket_weights, self.reversed_bit_map, self.decomp_table,
             torch.from_numpy(self.pred_np.astype(np.int64)).cuda().to(torch.uint32), self.N, self.C96.shape[0])
+
+    def _load_muvera(self, d):
+        import muvera_fde as M
+        cfg, params = M.load_params(d)
+        F = np.load(os.path.join(d, "fde_docs_fp16.npy"), mmap_mode="r")
+        assert F.shape[0] == self.N, f"{d}: {F.shape[0]:,} doc FDEs, index has {self.N:,} passages"
+        Fg = torch.empty(F.shape, dtype=torch.float16, device="cuda")
+        for a in range(0, F.shape[0], 200_000):              # chunked: no full host copy
+            Fg[a:a + 200_000] = torch.from_numpy(np.asarray(F[a:a + 200_000])).cuda()
+        self.muvera = {"F": Fg, "cfg": cfg, "params": {k: v.cuda() for k, v in params.items()}}
+        print(f"  MUVERA: {F.shape[0]:,} x {F.shape[1]} FDEs from {d} ({cfg})", flush=True)
 
     # ------------------------------------------------------------ calibration
     @torch.no_grad()
@@ -183,6 +217,8 @@ class Engines:
     def options(self):
         d = {"geometry": self.geometry, "stage3": self.stage3, "rerank": self.rerank,
              "rt_quantile": self.rt_quantile, "calibration": self.calibration}
+        if self.muvera is not None:
+            d["muvera"] = self.muvera["cfg"]
         if self.index is not None:
             d["index"] = {k: v for k, v in dict(self.index.info()).items() if k != "levels"}
             d["sparse_csr_dir"] = self.ds["sparse_csr_dir"]
@@ -257,11 +293,12 @@ class Engines:
         return self.index.candidates(Q_sub, topc, scores, p["nc"], self.ndocs(p), mask, p["eids"])
 
     def use_engine(self, engine):
-        """Set Stage 1 for a RAGRT engine (ragrt, ragrt_bf, ragrt_nofilter)."""
+        """Set Stage 1 mode and the Stage 2 codeword weight for a RAGRT engine."""
         self.index.set_stage1_mode(STAGE1_MODE[engine])
+        rtrag_corr_3d.set_codeword_weight(CODEWORD_WEIGHT[engine])
 
     def resolve(self, engine, p):
-        """ragrt_nofilter's eids = "all" means every codeword of the index."""
+        """eids = "all" (ragrt_nofilter, ragrt_ivf) means every codeword of the index."""
         if p.get("eids") == "all":
             p = dict(p, eids=self.E)
         return p
@@ -308,7 +345,29 @@ class Engines:
             [x[1] for x in preps], p["nc"], self.ndocs(p), C.TOP_K, query_mask=mask, k_eids=p["eids"])
         return out
 
+    # ------------------------------------------------------------ MUVERA
+    @torch.no_grad()
+    def muvera_candidates(self, Qf, p):
+        import muvera_fde as M
+        m = self.muvera
+        qv = M.query_fde(Qf.float(), m["params"], m["cfg"]).to(torch.float16)
+        s = m["F"] @ qv
+        return torch.topk(s, min(p["cands"], self.N)).indices.to(torch.int32).contiguous()
+
+    @torch.no_grad()
+    def muvera_search(self, Qf, p, mask=0):
+        """FDE inner product over all passages, top cands, TileMaxSim rerank (post-filter)."""
+        cands = self.muvera_candidates(Qf, p)
+        if mask:
+            cands = cands[(self.pred_gpu[cands.long()] & mask) != 0]
+        if cands.numel() == 0:
+            return []
+        s = self.tms_scores(Qf, cands)
+        return cands[torch.topk(s, min(C.TOP_K, cands.numel())).indices].tolist()
+
     def search(self, engine, Qf, ntok, p, mask=0):
+        if engine == "muvera":
+            return self.muvera_search(Qf, p, mask)
         if engine == "plaid":
             return self.plaid(Qf, p, mask)
         if engine == "ptms":

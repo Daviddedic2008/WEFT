@@ -244,18 +244,28 @@ class FP:
         return name
 
     def stage_throughput(self):
+        """Queries/s over --throughput_queries TEST queries, searched B at a time (B = 1..64, all),
+        the same batch sizes as RAGRT's pipelined throughput in run_benchmarks.py."""
         idx = self.open_index()
         p = self.R["selection"][self.primary()]["fastplaid"]["params"]
         qs = [self.Q[q] for q in self.test[:self.args.throughput_queries]]
         idx.search(queries_embeddings=qs[:WARMUP], top_k=C.TOP_K, show_progress=False, **p)
-        torch.cuda.synchronize(); t0 = time.perf_counter()
-        idx.search(queries_embeddings=qs, top_k=C.TOP_K, show_progress=False, **p)
-        torch.cuda.synchronize()
-        self.R["throughput"] = {"n_queries": len(qs), "batched_qps": len(qs) / (time.perf_counter() - t0), "params": p}
-        print(f"  throughput {self.R['throughput']['batched_qps']:.0f} queries/s (one batched call, {key(p)})", flush=True)
+        qps = {}
+        for B in [1, 2, 4, 8, 16, 32, 64, len(qs)]:
+            torch.cuda.synchronize(); t0 = time.perf_counter()
+            for a in range(0, len(qs), B):
+                idx.search(queries_embeddings=qs[a:a + B], top_k=C.TOP_K, show_progress=False, **p)
+            torch.cuda.synchronize()
+            qps[str(B)] = len(qs) / (time.perf_counter() - t0)
+            print(f"    batch {B:>5}: {qps[str(B)]:8.0f} queries/s", flush=True)
+        self.R["throughput"] = {"n_queries": len(qs), "qps_by_batch": qps, "params": p,
+                                "batched_qps": qps[str(len(qs))]}
+        print(f"  throughput ({key(p)}): best {max(qps.values()):.0f} queries/s", flush=True)
         M = self.compare_results() or {}
-        if "throughput" in M:
-            print(f"  main run throughput section: {json.dumps(M['throughput'])[:400]}")
+        T = M.get("throughput", {})
+        for e in ("ragrt", "ragrt_bf"):
+            if f"{e}_pipelined_qps" in T:
+                print(f"  main run {e} pipelined: " + ", ".join(f"B={b}: {v:.0f}" for b, v in T[f'{e}_pipelined_qps'].items()))
 
 
 def main():

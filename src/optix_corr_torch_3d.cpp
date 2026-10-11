@@ -73,6 +73,8 @@ extern "C" void launch_tile_maxsim_fused_decomp(
     float* d_out_scores, cudaStream_t stream);
 extern "C" void ragrt_set_rerank_mode(int mode);
 extern "C" int  ragrt_get_rerank_mode();
+extern "C" void ragrt_set_codeword_weight(float w);
+extern "C" float ragrt_get_codeword_weight();
 
 static const char* DROP_STAT_NAMES[] = {
     "launches", "rays", "rays_overflow", "hits_lost_to_cap", "combos", "combos_found",
@@ -732,6 +734,7 @@ public:
         d["stage3"] = stage3_sparse ? "sparse" : "dense";
         d["rerank"] = ragrt_get_rerank_mode() == 1 ? "wmma" : "simt";
         d["eid_bytes"] = b_eid_bytes;
+        d["codeword_weight"] = ragrt_get_codeword_weight();
         pybind11::list lv;
         for (size_t l = 0; l < level_k.size(); ++l) {
             pybind11::dict x;
@@ -813,6 +816,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         TORCH_CHECK(mode == "wmma" || mode == "simt", "rerank mode must be 'wmma' or 'simt'");
         ragrt_set_rerank_mode(mode == "wmma" ? 1 : 0);
     }, "Stage-4 / TMS kernel: 'wmma' (tensor cores, default) or 'simt' (original)");
+    m.def("set_codeword_weight", [](double w) { ragrt_set_codeword_weight((float)w); },
+          "Weight of the codeword term q_s.w in each posting's Stage-2 score: 1 (default) or 0 (centroid-only ablation)");
+    m.def("get_codeword_weight", []() { return (double)ragrt_get_codeword_weight(); });
     m.def("get_rerank_mode", []() { return std::string(ragrt_get_rerank_mode() == 1 ? "wmma" : "simt"); });
     m.def("bruteforce_stage1", &bruteforce_stage1_standalone,
           "Exact top-k positive codewords per ray on CUDA cores: (q [R,3], codewords [32*E,3], k, max_hits) -> (ids, vals, counts)");

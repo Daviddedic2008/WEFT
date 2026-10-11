@@ -7,7 +7,7 @@
 3. Benchmarks: `run_benchmarks.py --dataset <name>` (tune/test split, sweeps, operating points, filtered runs, throughput, stage counters).
 4. Figures and `summary.md`: `plot_results.py --dataset <name>`; DRAM: `profile_dram.py --dataset <name>` (Nsight Compute, calibrated).
 
-Paths live in `eval_config.py`. CPU tests: `tests/test_index_lib.py`, `tests/test_eval_lib.py`, `tests/test_harness_smoke.py`, `tests/test_builder_cpu.py`. GPU tests (after building): `tests/test_gpu_kernels.py`, `tests/test_stage1_gpu.py`.
+Paths live in `eval_config.py`. CPU tests: `tests/test_index_lib.py`, `tests/test_eval_lib.py`, `tests/test_harness_smoke.py`, `tests/test_builder_cpu.py`, `tests/test_ablation_cpu.py`. GPU tests (after building): `tests/test_gpu_kernels.py`, `tests/test_stage1_gpu.py`.
 
 ## RAGRT stages and options
 
@@ -16,6 +16,9 @@ Paths live in `eval_config.py`. CPU tests: `tests/test_index_lib.py`, `tests/tes
 - Stage 3 (`--stage3`): `sparse` (default) radix-sorts only the touched postings; `dense` uses an ntok × N table.
 - Stage 4 (`--rerank`): `wmma` (default) tensor-core TileMaxSim; `simt` is the original kernel. PLAID+TMS uses the same kernel.
 - No-RT ablation: engine `ragrt_bf` runs Stage 1 on CUDA cores with identical output (polar: the same threshold as a linear scan; fan: exact top-k).
+- Other ablations (`engines.py`): `ragrt_nofilter` (every codeword, so every list of a probed centroid), `ragrt_centroid` (same lists as `ragrt_bf`, postings scored q·c without the codeword term; `set_codeword_weight`), `ragrt_ivf` (plain IVF on RAGRT's kernels, needs a `build_plain_ivf.py` index), `muvera` (MUVERA FDEs from `build_muvera_fde.py`, exact GPU inner product, same rerank).
+
+Attribution: `run_attribution.sh <dataset> <base results subdir> [centroid profile ivf muvera]` runs the ablations against a main run; `summary.md` gets an attribution-chain table (PLAID+TMS → plain IVF on RAGRT kernels → codeword score / codebook filter → RT) and a torch.profiler table (wall vs GPU-busy time, kernels, memcpys, host syncs per query). FastPLAID: `export_embeddings.py`, then `bench_fastplaid.py` in its own venv. MS MARCO end to end: `run_msmarco.sh`.
 
 Diagnostics: `diag_stage1.py` (recall of the exact top-k codewords per ray, hits per ray, Stage-1 time per variant), `diag_pca_filter.py`.
 

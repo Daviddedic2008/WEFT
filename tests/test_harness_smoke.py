@@ -31,8 +31,13 @@ RNG = np.random.default_rng(0)
 DOCS = torch.tensor(RNG.normal(size=(N_DOCS, DIM)), dtype=torch.float32)
 
 
+FAKE_RAGRT = ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf")
+
+
 def cfg_key(engine, p):
-    return (f"nc={p['nc']} eids={p['eids']} ndocs={p['ndocs']}" if engine in ("ragrt", "ragrt_bf", "ragrt_nofilter")
+    if engine == "muvera":
+        return f"cands={p['cands']}"
+    return (f"nc={p['nc']} eids={p['eids']} ndocs={p['ndocs']}" if engine in FAKE_RAGRT
             else f"nc={p['ncells']} th={p['threshold']} ndocs={p['ndocs']}")
 
 
@@ -72,7 +77,15 @@ class FakeEngines:
         exact = DOCS[cand] @ Qf
         return cand[torch.argsort(exact, descending=True)][:100].tolist()
 
+    def muvera_candidates(self, Qf, p):
+        return torch.topk(DOCS @ Qf, min(N_DOCS, p["cands"])).indices.to(torch.int32)
+
+    def muvera_search(self, Qf, p, mask=0):
+        return self._ranked(Qf, max(min(N_DOCS, p["cands"]), 10), 3.0, mask)
+
     def search(self, engine, Qf, ntok, p, mask=0):
+        if engine == "muvera":
+            return self.muvera_search(Qf, p, mask)
         if engine.startswith("ragrt"):
             return self.ragrt(Qf, ntok, p, mask)
         return self._ranked(Qf, max(min(N_DOCS, p["ndocs"] // 4), 10), 2.0, mask)
@@ -109,7 +122,7 @@ class FakeEngines:
 
 
 eng_mod = types.ModuleType("engines")
-eng_mod.Engines, eng_mod.cfg_key, eng_mod.RAGRT_ENGINES = FakeEngines, cfg_key, ("ragrt", "ragrt_bf", "ragrt_nofilter")
+eng_mod.Engines, eng_mod.cfg_key, eng_mod.RAGRT_ENGINES = FakeEngines, cfg_key, FAKE_RAGRT
 sys.modules["engines"] = eng_mod
 
 import eval_config as C
@@ -182,14 +195,48 @@ def main():
     assert "speedup_vs_ptms" in R2["comparisons"][R2["primary_target"]]
     assert R2["breakdown"]["ptms"] == R["breakdown"]["ptms"]
 
+    # ablation engines merged into the main run, plus the profiler attribution stage
+    sys.argv = ["run_benchmarks.py", "--dataset", "msmarco", "--quick", "--tune_size", "60",
+                "--engines", "ragrt_centroid,muvera", "--muvera_dir", TMP,
+                "--stages", "sweep,select,test,breakdown,throughput,attribution",
+                "--repeats", "1", "--max_filter_queries", "40", "--throughput_queries", "32", "--targets", "0.5,0.9"]
+    run_benchmarks.main()
+    assert FakeEngines.calls[-1]["muvera_dir"] == TMP
+    R = json.load(open(os.path.join(os.environ["RAGRT_RESULTS"], "msmarco", "results.json")))
+    assert {"ragrt_centroid", "muvera"} <= set(R["sweep"]) and "muvera" in R["breakdown"]
+    att = [a for c in R["comparisons"].values() for a in c.get("attribution", [])]
+    steps = {(a["slow"], a["fast"]) for a in att}
+    assert {("ragrt_centroid", "ragrt_bf"), ("ragrt_nofilter", "ragrt_bf"), ("ragrt_bf", "ragrt"),
+            ("muvera", "ragrt_bf"), ("ptms", "ragrt_bf")} <= steps, steps
+    assert all("gt_r10_diff" in a for a in att)
+    assert {"ragrt_centroid", "muvera"} <= set(R["attribution"]), R["attribution"].keys()
+    assert R["primary_fallback"] == {"muvera": "gt_r10>=0.90"}, R["primary_fallback"]
+
+    # plain-IVF style run: other index, every other engine imported, only ragrt_ivf rerun
+    sys.argv = ["run_benchmarks.py", "--dataset", "msmarco", "--quick", "--tune_size", "60",
+                "--results_subdir", "ivf", "--sparse_csr_dir", C.DATASETS["msmarco"]["sparse_csr_dir"],
+                "--baseline_from", src, "--import_engines", "plaid,ptms,ragrt,ragrt_bf,ragrt_nofilter,ragrt_centroid",
+                "--engines", "ragrt,ragrt_ivf", "--stages", "sweep,select,test",
+                "--repeats", "1", "--targets", "0.5,0.9"]
+    run_benchmarks.main()
+    R3 = json.load(open(os.path.join(src, "ivf", "results.json")))
+    assert R3["sweep"]["ragrt"] == R["sweep"]["ragrt"], "ragrt must be imported, not rerun on the IVF index"
+    steps = {(a["slow"], a["fast"]) for a in R3["comparisons"]["plaid_default"]["attribution"]}
+    assert {("ptms", "ragrt_ivf"), ("ragrt_ivf", "ragrt_nofilter"), ("ragrt_ivf", "ragrt_bf")} <= steps, steps
+    sys.argv = ["plot_results.py", "--dataset", "msmarco", "--results_subdir", "ivf"]
     import plot_results
+    plot_results.main()
+    assert "Attribution chain" in open(os.path.join(src, "ivf", "summary.md")).read()
+
     sys.argv = ["plot_results.py", "--dataset", "msmarco"]
     plot_results.main()
     out = os.path.join(os.environ["RAGRT_RESULTS"], "msmarco")
     for f in ["fig_pareto.png", "fig_operating_point.png", "fig_breakdown.png", "fig_latency_cdf.png",
               "fig_filtered.png", "fig_throughput.png", "summary.md"]:
         assert os.path.getsize(os.path.join(out, f)) > 0, f
-    print(open(os.path.join(out, "summary.md")).read())
+    md = open(os.path.join(out, "summary.md")).read()
+    assert "Where the time goes" in md and "Attribution chain" in md
+    print(md)
     print("SMOKE TEST PASSED", out)
 
 

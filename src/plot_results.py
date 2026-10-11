@@ -24,8 +24,11 @@ STYLE = {
     "ptms":  {"color": "#1baf7a", "marker": "D", "label": "PLAID+TMS"},
     "ragrt_bf": {"color": "#eda100", "marker": "^", "label": "RAGRT, no RT (CUDA-core Stage 1)"},
     "ragrt_nofilter": {"color": "#8c564b", "marker": "v", "label": "RAGRT, codebook filter off"},
+    "ragrt_centroid": {"color": "#7a5195", "marker": "P", "label": "RAGRT, no codeword score"},
+    "ragrt_ivf": {"color": "#5f6b6d", "marker": "X", "label": "Plain IVF on RAGRT kernels"},
+    "muvera": {"color": "#c2185b", "marker": "*", "label": "MUVERA (FDE + TMS)"},
 }
-ALL_ENGINES = ["plaid", "ptms", "ragrt", "ragrt_bf", "ragrt_nofilter"]
+ALL_ENGINES = ["plaid", "ptms", "ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "muvera"]
 ENGINES = ALL_ENGINES          # narrowed in main() to the engines present in results.json
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 
@@ -107,11 +110,18 @@ def fig_breakdown(R, out):
         bars.append(("PLAID", [("Stages 1-3", b["plaid"]["s1_3"]), ("Stage 4 (est.)", b["plaid"]["s4_est"])]))
     if "ptms" in b:
         bars.append(("PLAID+TMS", [("Stages 1-3", b["ptms"]["s1_3"]), ("Stage 4 TMS", b["ptms"]["s4"])]))
-    for e, name, s1 in (("ragrt", "RAGRT", "1 RT"), ("ragrt_bf", "RAGRT no-RT", "1 brute")):
+    if "muvera" in b:
+        bars.append(("MUVERA", [("FDE MIPS", b["muvera"]["s1_3"]), ("Stage 4 TMS", b["muvera"]["s4"])]))
+    for e, name, s1 in (("ragrt", "RAGRT", "1 RT"), ("ragrt_bf", "RAGRT no-RT", "1 brute"),
+                        ("ragrt_nofilter", "filter off", "1 all"), ("ragrt_centroid", "no codeword score", "1 brute"),
+                        ("ragrt_ivf", "plain IVF, RAGRT kernels", "1 all")):
         if e in b:
             r = b[e]
             bars.append((name, [("0b prep", r["s0b_prep"]), (s1, r["s1_rt"]), ("2 gather", r["s2_gather"]),
                                 ("3 score", r["s3_score"]), ("4 TMS", r["s4_tms"])]))
+    if not bars:
+        print("  skipping fig_breakdown (no breakdown in this run)")
+        return
     shades = ["#cde2fb", "#9ec5f4", "#6ba6ea", "#2a78d6", "#1c5299"]
     longest = max(sum(v for _, v in segs) for _, segs in bars)
     for i, (name, segs) in enumerate(bars):
@@ -124,8 +134,9 @@ def fig_breakdown(R, out):
             left += v
         ax.text(left, i, f"  {left:.2f} ms", va="center", color=INK, fontsize=8)
     ax.set_yticks(range(len(bars))); ax.set_yticklabels([n for n, _ in bars]); ax.invert_yaxis()
-    ax.set_xlabel("Median ms per query (TEST). Stage 0a query encoding, "
-                  f"{b['stage0a_encode_median']:.2f} ms, is common to all and excluded")
+    enc = b.get("stage0a_encode_median", R.get("stage0a_encode", {}).get("median"))
+    ax.set_xlabel("Median ms per query (TEST). Stage 0a query encoding"
+                  + (f", {enc:.2f} ms," if enc is not None else "") + " is common to all and excluded")
     ax.grid(axis="y", visible=False)
     save(fig, out, "fig_breakdown.png")
 
@@ -194,7 +205,7 @@ def fig_throughput(R, out):
         if k in T:
             ax.axhline(T[k], color=STYLE[e]["color"], linewidth=1.5, linestyle="--")
             ax.text(1, T[k], f" {STYLE[e]['label']} sequential {T[k]:.0f} QPS", va="bottom", fontsize=8, color=INK2)
-    for e in ("ragrt", "ragrt_bf"):
+    for e in ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf"):
         k = f"{e}_pipelined_qps"
         if k in T:
             B = sorted(int(b) for b in T[k])
@@ -255,6 +266,23 @@ def summary_md(R, out, metric_name):
         L.append(f"| {name} | {sp('speedup_vs_plaid')} | {sp('speedup_vs_ptms')} | "
                  f"{f('gt_r10_diff_vs_ptms')} | {f('official_diff_vs_ptms')} | {sp('speedup_vs_ragrt_bf')} | "
                  f"{f('gt_r10_diff_vs_ragrt_bf')} | {sp('speedup_vs_ragrt_nofilter')} | {f('gt_r10_diff_vs_ragrt_nofilter')} |")
+    att = [(name, c["attribution"]) for name, c in R.get("comparisons", {}).items() if c.get("attribution")]
+    if att:
+        L += ["", "## Attribution chain (latency ratio slow/fast at each target; quality diff = fast - slow)", "",
+              f"| target | step | slow -> fast | latency ratio | exact R@10 diff | {metric_name} diff |",
+              "|---|---|---|---|---|---|"]
+        for name, rows in att:
+            for a in rows:
+                f = lambda k: f"{a[k]['mean']:+.4f} [{a[k]['ci95'][0]:+.4f}, {a[k]['ci95'][1]:+.4f}]" if k in a else "n/a"
+                L.append(f"| {name} | {a['what']} | {a['slow']} -> {a['fast']} | {a['latency_ratio']:.2f}x | "
+                         f"{f('gt_r10_diff')} | {f('official_diff')} |")
+    if "attribution" in R:
+        L += ["", "## Where the time goes (torch.profiler, primary point, per query)", "",
+              "| engine | wall ms | GPU-busy ms | host/idle ms | kernels | memcpy/memset | host syncs |",
+              "|---|---|---|---|---|---|---|"]
+        for e, o in R["attribution"].items():
+            L.append(f"| {e} | {o['wall_ms']:.2f} | {o['gpu_busy_ms']:.2f} | {max(0, o['wall_ms'] - o['gpu_busy_ms']):.2f} | "
+                     f"{o['kernels']:.1f} | {o['memcpys']:.1f} | {o['syncs']:.1f} |")
     if "drops" in R:
         L += ["", "## RAGRT stage counters (diagnostic pass, counters off during timing)", "",
               "| config | stage-1 hits/ray | rays short of k | rays over hit cap | tasks dropped (MAX_TASKS) | "

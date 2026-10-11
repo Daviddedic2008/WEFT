@@ -17,7 +17,15 @@ Methodology, in order:
      that reaches it, then evaluated on TEST.
 
 Stages (each saved to results.json, so they can be rerun independently):
-  sweep, select, test, breakdown, filtered, throughput, drops
+  sweep, select, test, breakdown, filtered, throughput, drops, attribution
+  attribution: torch.profiler pass per engine at the primary point: wall ms vs GPU-busy ms,
+  kernels, memcpys and host syncs per query (where the time goes: kernels or host overhead).
+
+Ablation engines (engines.py): ragrt_bf (no RT), ragrt_nofilter (codebook filter off),
+ragrt_centroid (no codeword score term), ragrt_ivf (plain IVF on the RAGRT kernels; needs a
+build_plain_ivf.py index via --sparse_csr_dir), muvera (--muvera_dir). The "attribution"
+block of each comparison lists latency ratios and paired quality differences for the
+ablation chain ptms -> ragrt_ivf -> ragrt_nofilter / ragrt_centroid -> ragrt_bf -> ragrt.
 
 RAGRT options (see engines.py): --geometry polar|fan, --stage3 sparse|dense,
 --rerank wmma|simt (also used by ptms), --rt_quantile, --sparse_csr_dir (another
@@ -41,7 +49,19 @@ from engines import Engines, cfg_key, RAGRT_ENGINES
 import rtrag_corr_3d
 
 CORE = ["plaid", "ptms", "ragrt"]          # the primary operating point must be reachable by these
-ENGINES = CORE + ["ragrt_bf", "ragrt_nofilter"]   # ablations: no-RT Stage 1; codebook filter off
+# ablations: no-RT Stage 1; codebook filter off; no codeword score; plain IVF on RAGRT kernels; MUVERA
+ENGINES = CORE + ["ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "muvera"]
+# (slow, fast, what the step from slow to fast changes); ratio = latency(slow) / latency(fast)
+ATTRIBUTION = [
+    ("ptms", "ragrt_ivf", "engine: PLAID candidate generation -> same algorithm on RAGRT kernels"),
+    ("ragrt_ivf", "ragrt_nofilter", "subspace codeword term in the score (every list)"),
+    ("ragrt_nofilter", "ragrt_bf", "codebook filter (fetch only top-eids lists)"),
+    ("ragrt_centroid", "ragrt_bf", "codeword term in the score (same lists)"),
+    ("ragrt_ivf", "ragrt_bf", "subspace codebooks overall (score + filter)"),
+    ("ragrt_bf", "ragrt", "RT cores for Stage 1"),
+    ("ptms", "ragrt_bf", "everything except RT"),
+    ("muvera", "ragrt_bf", "RAGRT (no RT) vs MUVERA"),
+]
 DEFAULT_ENGINES = CORE + ["ragrt_bf"]
 PLAID_DEFAULT_K100 = {"ncells": 2, "threshold": 0.45, "ndocs": 1024}   # ColBERT Searcher defaults for k=100
 
@@ -56,6 +76,8 @@ NOFILTER_GRID = [{"nc": n, "eids": "all", "ndocs": d}
                  for n in [1, 2, 4, 8, 16, 32, 64]
                  for d in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]]
 QUICK_RAGRT = [{"nc": 32, "eids": 16, "ndocs": 4096}, {"nc": 16, "eids": 32, "ndocs": 16384}]
+MUVERA_GRID = [{"cands": c} for c in [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]]
+ATTRIB_QUERIES = 200
 BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 WARMUP = 5
 
@@ -97,9 +119,12 @@ class Bench:
         print(f"[{args.dataset}] {len(qids):,} queries with ground truth: tune {len(self.tune):,}, "
               f"test {len(self.test):,}", flush=True)
 
+        if "muvera" in self.engines and not args.muvera_dir:
+            sys.exit("FATAL: --engines muvera needs --muvera_dir (build_muvera_fde.py)")
+        extra = {"muvera_dir": args.muvera_dir} if "muvera" in self.engines else {}
         self.eng = Engines(self.ds, load_ragrt=any(e in RAGRT_ENGINES for e in self.engines),
                            geometry=args.geometry, stage3=args.stage3, rerank=args.rerank,
-                           rt_quantile=args.rt_quantile)
+                           rt_quantile=args.rt_quantile, **extra)
         self.bank = {}
         enc_ms = []
         need = self.tune + self.test
@@ -115,7 +140,7 @@ class Bench:
         if self.eng.index is not None:
             self.eng.calibrate([self.bank[q] for q in self.tune[:args.calib_queries]])
         if args.baseline_from:
-            self.import_baselines(args.baseline_from)
+            self.import_baselines(args.baseline_from, args.import_engines)
         self.R["meta"] = {**self.R.get("meta", {}),
             "date": datetime.datetime.now().isoformat(timespec="seconds"),
             "gpu": torch.cuda.get_device_name(0),
@@ -126,13 +151,13 @@ class Bench:
             "ragrt": self.eng.options(),
         }
 
-    def import_baselines(self, src_dir):
-        """Copy plaid/ptms results (sweep, test, per-query, breakdown, filtered, throughput)."""
+    def import_baselines(self, src_dir, engines=("plaid", "ptms")):
+        """Copy other engines' results (sweep, test, per-query, breakdown, filtered, throughput)."""
         src = json.load(open(os.path.join(src_dir, "results.json")))
         if src.get("split") != self.R["split"]:
             sys.exit(f"FATAL: --baseline_from split {src.get('split')} != this run's {self.R['split']}")
         perq = dict(np.load(os.path.join(src_dir, "test_perquery.npz")))
-        base = [e for e in ("plaid", "ptms") if e in src.get("sweep", {})]
+        base = [e for e in engines if e in src.get("sweep", {})]
         for e in base:
             self.R.setdefault("sweep", {})[e] = src["sweep"][e]
             for k, v in src.get("test", {}).items():
@@ -204,8 +229,10 @@ class Bench:
     def stage_sweep(self):
         plaid_grid = QUICK_PLAID if self.args.quick else PLAID_GRID
         ragrt_grid = QUICK_RAGRT if self.args.quick else RAGRT_GRID
+        nof = NOFILTER_GRID[:2] if self.args.quick else NOFILTER_GRID
         grids = {"plaid": plaid_grid, "ptms": plaid_grid, "ragrt": ragrt_grid, "ragrt_bf": ragrt_grid,
-                 "ragrt_nofilter": NOFILTER_GRID[:2] if self.args.quick else NOFILTER_GRID}
+                 "ragrt_nofilter": nof, "ragrt_centroid": ragrt_grid, "ragrt_ivf": nof,
+                 "muvera": MUVERA_GRID[:2] if self.args.quick else MUVERA_GRID}
         if PLAID_DEFAULT_K100 not in grids["plaid"]:
             grids["plaid"] = grids["plaid"] + [PLAID_DEFAULT_K100]
         sweep = self.R.setdefault("sweep", {})
@@ -285,19 +312,47 @@ class Bench:
                     c[engine] = test[f"{engine}|{s[engine]['key']}"]
             if "ragrt" in c:
                 rk = f"ragrt|{s['ragrt']['key']}"
-                for base in ("plaid", "ptms", "ragrt_bf", "ragrt_nofilter"):
+                for base in ("plaid", "ptms", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "muvera"):
                     if base in c:
                         bk = f"{base}|{s[base]['key']}"
                         c[f"speedup_vs_{base}"] = c[base]["lat"]["median"] / c["ragrt"]["lat"]["median"]
                         for metric in ("gt_r10", "official"):
                             m, lo, hi = E.paired_diff_ci(self.perq[f"{rk}|{metric}"], self.perq[f"{bk}|{metric}"])
                             c[f"{metric}_diff_vs_{base}"] = {"mean": m, "ci95": [lo, hi]}
+            att = []
+            for slow, fast, what in ATTRIBUTION:
+                if slow in c and fast in c:
+                    a = {"slow": slow, "fast": fast, "what": what,
+                         "latency_ratio": c[slow]["lat"]["median"] / c[fast]["lat"]["median"]}
+                    sk, fk = f"{slow}|{s[slow]['key']}", f"{fast}|{s[fast]['key']}"
+                    for metric in ("gt_r10", "official"):
+                        if f"{sk}|{metric}" in self.perq and f"{fk}|{metric}" in self.perq:
+                            m, lo, hi = E.paired_diff_ci(self.perq[f"{fk}|{metric}"], self.perq[f"{sk}|{metric}"])
+                            a[f"{metric}_diff"] = {"mean": m, "ci95": [lo, hi]}
+                    att.append(a)
+            if att:
+                c["attribution"] = att
             comps[name] = c
         self.R["comparisons"] = comps
 
     def primary(self):
-        s = self.R["selection"][self.R["primary_target"]]
-        return {e: s[e]["params"] for e in self.engines if s.get(e)}
+        """Primary-point config per engine; an engine that cannot reach it (e.g. MUVERA) uses the
+        highest target it does reach, recorded in R["primary_fallback"]."""
+        sel = self.R["selection"]
+        s = sel[self.R["primary_target"]]
+        out = {e: s[e]["params"] for e in self.engines if s.get(e)}
+        fb = self.R.setdefault("primary_fallback", {})
+        for e in self.engines:
+            if e in out:
+                fb.pop(e, None)
+                continue
+            reach = [(v["target_gt_r10"], n) for n, v in sel.items() if v.get(e)]
+            if reach:
+                name = max(reach)[1]
+                out[e] = sel[name][e]["params"]
+                fb[e] = name
+                print(f"  {e} cannot reach {self.R['primary_target']}; using its {name} config", flush=True)
+        return out
 
     def stage_breakdown(self):
         P = self.primary()
@@ -333,6 +388,20 @@ class Bench:
                 s13.append((t1 - t0) * 1000); s4.append((time.perf_counter() - t1) * 1000)
             out["ptms"] = {"s1_3": float(np.median(s13)), "s4": float(np.median(s4)),
                            "total": float(np.median(np.array(s13) + np.array(s4)))}
+        if "muvera" in P:
+            s13, s4 = [], []
+            for q in qids[:WARMUP]:
+                eng.muvera_search(self.bank[q][0], P["muvera"])
+            for q in qids:
+                Qf, _ = self.bank[q]
+                torch.cuda.synchronize(); t0 = time.perf_counter()
+                c = eng.muvera_candidates(Qf, P["muvera"]); torch.cuda.synchronize()
+                t1 = time.perf_counter()
+                s = eng.tms_scores(Qf, c)
+                c[torch.topk(s, min(C.TOP_K, c.numel())).indices].tolist(); torch.cuda.synchronize()
+                s13.append((t1 - t0) * 1000); s4.append((time.perf_counter() - t1) * 1000)
+            out["muvera"] = {"s1_3": float(np.median(s13)), "s4": float(np.median(s4)),
+                             "total": float(np.median(np.array(s13) + np.array(s4)))}
         for e in RAGRT_ENGINES:
             if e not in P:
                 continue
@@ -404,6 +473,35 @@ class Bench:
                 self.eng.use_engine("ragrt")
         print(f"  throughput: {json.dumps(out)}", flush=True)
 
+    def stage_attribution(self):
+        """
+        Where each engine's time goes at the primary point: one torch.profiler (CUPTI) pass over
+        ATTRIB_QUERIES TEST queries. GPU-busy = summed device time of kernels and memcpys (the
+        engines run on one stream per query, so this is not double counted); host = wall - busy.
+        Profiling inflates wall time somewhat, so wall is also measured without the profiler.
+        """
+        from torch.profiler import profile, ProfilerActivity
+        P = self.primary()
+        qids = self.test[:ATTRIB_QUERIES]
+        out = self.R.setdefault("attribution", {})
+        fns = {e: (lambda q, e=e: self.eng.search(e, *self.bank[q], P[e])) for e in P}
+        if "ptms" in P:
+            fns["ptms_stages1_3"] = lambda q: self.eng.plaid_stage3(self.bank[q][0], P["ptms"])
+        for name, fn in fns.items():
+            for q in qids[:WARMUP]:
+                fn(q)
+            torch.cuda.synchronize(); t0 = time.perf_counter()
+            for q in qids:
+                fn(q); torch.cuda.synchronize()
+            wall = (time.perf_counter() - t0) * 1000 / len(qids)
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+                for q in qids:
+                    fn(q); torch.cuda.synchronize()
+            out[name] = {"wall_ms": wall, **profile_counts(prof, len(qids))}
+            o = out[name]
+            print(f"    {name:<16} wall {o['wall_ms']:6.2f} ms  gpu busy {o['gpu_busy_ms']:6.2f} ms  "
+                  f"kernels {o['kernels']:6.1f}  memcpy {o['memcpys']:5.1f}  syncs {o['syncs']:5.1f}  per query", flush=True)
+
     def stage_drops(self):
         qids = self.test[:self.args.max_filter_queries]
         out = self.R.setdefault("drops", {})
@@ -434,6 +532,29 @@ class Bench:
             rtrag_corr_3d.set_drop_stats(False)
 
 
+def profile_counts(prof, n):
+    """Per-query kernel / memcpy / sync counts and device time from a torch.profiler run."""
+    kern = mem = sync = 0
+    busy_us = 0.0
+    for ev in prof.events():
+        name = ev.name
+        dev = str(getattr(ev, "device_type", "")).endswith("CUDA")
+        if dev:
+            t = getattr(ev, "device_time", None)
+            if t is None:
+                t = getattr(ev, "cuda_time", 0.0)
+            busy_us += t
+            if "memcpy" in name.lower() or "memset" in name.lower():
+                mem += 1
+            else:
+                kern += 1
+        elif "Synchronize" in name or name in ("cudaMemcpy", "cudaMemcpyAsync"):
+            sync += 1
+    # syncs exclude the harness's own torch.cuda.synchronize() after every query
+    return {"gpu_busy_ms": busy_us / 1000 / n, "kernels": kern / n, "memcpys": mem / n,
+            "syncs": max(0.0, sync / n - 1.0)}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", required=True, choices=list(C.DATASETS))
@@ -455,10 +576,13 @@ def main():
     ap.add_argument("--rerank", default="wmma", choices=["wmma", "simt"])
     ap.add_argument("--rt_quantile", type=float, default=0.05)
     ap.add_argument("--calib_queries", type=int, default=300, help="TUNE queries used to calibrate polar thresholds")
-    ap.add_argument("--baseline_from", default=None, help="results dir whose plaid/ptms results to import")
+    ap.add_argument("--baseline_from", default=None, help="results dir whose results to import (see --import_engines)")
+    ap.add_argument("--import_engines", type=lambda s: s.split(","), default=["plaid", "ptms"],
+                    help="engines imported with --baseline_from (they are not rerun), e.g. plaid,ptms,ragrt,ragrt_bf")
+    ap.add_argument("--muvera_dir", default=None, help="FDE dir from build_muvera_fde.py (engine muvera)")
     args = ap.parse_args()
     if args.baseline_from:
-        args.engines = [e for e in args.engines if e in RAGRT_ENGINES]
+        args.engines = [e for e in args.engines if e not in args.import_engines and e not in ("plaid", "ptms")]
 
     b = Bench(args)
     for st in args.stages.split(","):

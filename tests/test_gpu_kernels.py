@@ -142,8 +142,10 @@ def synthetic_index(E, N=3000, NC=48, seed=0):
     pids = np.repeat(np.arange(N), doclens)
     rp, ce, ln, offs, packed = [], [], [], [], []
     col_base = packed_base = 0
+    active = np.zeros(T, dtype=bool)
     for s in range(S):
         m = rng.random(T) < 0.3
+        active |= m
         eids = rng.integers(0, E, int(m.sum()))
         csr = L.build_subspace_csr(codes[m], eids, pids[m], NC, col_base, packed_base)
         rp.append(csr["row_ptrs"]); ce.append(csr["col_eids"]); ln.append(csr["lengths"])
@@ -154,6 +156,8 @@ def synthetic_index(E, N=3000, NC=48, seed=0):
     t = lambda a: torch.from_numpy(a).to(dev)
     doc_off = torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(torch.from_numpy(doclens), 0)]).to(dev)
     pred = rng.integers(0, 2, N).astype(np.int64)
+    global LAST_SYNTH
+    LAST_SYNTH = {"codes": codes, "pids": pids, "active": active}
     bind = dict(
         csr_row_ptrs=t(np.stack(rp).astype(np.int64)),
         csr_col_eids=t(eids.view(np.int16) if eids.dtype == np.uint16 else eids),
@@ -203,6 +207,56 @@ def test_stage3(E, seed=0):
     return idx, bind
 
 
+def test_codeword_weight(E=200, seed=3):
+    """
+    Codeword weight 0 + all-codewords Stage 1 (the ragrt_ivf engine) must equal centroid
+    interaction: per query token t, max over its probed centroids c that the passage has a
+    token in, of scores[t, c]; summed over t. (Every token here is active in some subspace.)
+    """
+    bind, _ = synthetic_index(E, seed=seed)
+    NC, N = bind["num_centroids"], bind["num_passages"]
+    codes, pids = LAST_SYNTH["codes"], LAST_SYNTH["pids"]
+    g = torch.Generator(device=dev).manual_seed(seed)
+    idx = X.CorrIndex3D(C.PTX_PATH)
+    idx.build((torch.randn(S, E, 3, device=dev, generator=g) * 0.1).cpu().contiguous(), 0.95, 4)
+    idx.set_geometry(0)
+    idx.bind_index(*bind.values())
+    idx.set_stage3_sparse(True)
+    has = np.zeros((N, NC), dtype=bool)
+    act = LAST_SYNTH["active"]
+    has[pids[act], codes[act]] = True
+    try:
+        for trial in range(3):
+            nq, k_cent = 10, 6
+            Q = torch.randn(nq, S, 3, device=dev, generator=g)
+            scores = torch.rand(nq, NC, device=dev, generator=g)
+            topc = scores.topk(k_cent, dim=1).indices.to(torch.int32).contiguous()
+            X.set_codeword_weight(0.0)
+            idx.set_stage1_mode(2)
+            p, a = idx.candidates(Q, topc, scores, k_cent, N, 0, E)
+            p, a = p.cpu().numpy(), a.cpu().numpy()
+            sc, tc = scores.cpu().numpy(), topc.cpu().numpy()
+            ref = np.zeros(N)
+            for t in range(nq):
+                v = np.where(has[:, tc[t]], sc[t, tc[t]][None, :], -np.inf).max(1)
+                ref += np.where(np.isfinite(v), v, 0)
+            keep = p >= 0
+            assert set(p[keep].tolist()) == set(np.flatnonzero(ref > 0).tolist()), f"trial {trial}: touched sets differ"
+            err = np.abs(a[keep] - ref[p[keep]]).max()
+            assert err < 2e-3 * nq, (trial, err)           # fp16 scores inside the sort key
+            # the knob changes scores and is restored
+            idx.set_stage1_mode(1)
+            _, a0 = idx.candidates(Q, topc, scores, k_cent, 64, 0, 16)
+            X.set_codeword_weight(1.0)
+            _, a1 = idx.candidates(Q, topc, scores, k_cent, 64, 0, 16)
+            assert not torch.equal(a0, a1), "codeword weight had no effect"
+    finally:
+        X.set_codeword_weight(1.0)
+        idx.set_stage1_mode(0)
+    assert X.get_codeword_weight() == 1.0
+    print(f"  codeword weight 0 + all codewords == centroid interaction (E={E}, 3 queries)")
+
+
 def test_rerank(bind):
     N = bind["num_passages"]
     g = torch.Generator(device=dev).manual_seed(1)
@@ -242,4 +296,5 @@ if __name__ == "__main__":
     for E in (200, 300):
         idx, bind = test_stage3(E)
     test_rerank(bind)
+    test_codeword_weight()
     print("ALL GPU KERNEL TESTS PASSED")
