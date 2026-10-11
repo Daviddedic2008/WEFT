@@ -97,6 +97,26 @@ def test_stage1(E, nq=24, ks=(4, 16, 64), q=0.05, seed=0):
         report.append(f"E={E} k={k}: {ok_set} rays exact set, {ok_topk}/{nq * S} rays with >=k hits have the exact "
                       f"top-k, mean hits/ray {mean_hits:.1f} (of E={E}), {overflow} rays over the hit cap, boundary diffs {boundary}")
 
+    # polar_iter: k nearest-hit traversals, no hit shaders -> exact top-k above tau, in order
+    idx.set_geometry(2)
+    for l, k in enumerate(ks):
+        c, v, n = [t.cpu() for t in idx.stage1_hits(Q.contiguous(), k)]
+        ok = 0
+        for t in range(nq):
+            for s in range(S):
+                r = t * S + s
+                u = sc_unit[t, s]
+                above = torch.nonzero(u >= float(taus[l, s])).squeeze(1)
+                want = above[torch.argsort(sc[t, s][above], descending=True)][:k]
+                got = c[r, :int(n[r])]
+                assert int(n[r]) == len(want) or abs(int(n[r]) - len(want)) <= 1, (r, int(n[r]), len(want))
+                m = min(len(got), len(want))
+                assert torch.allclose(sc[t, s][got[:m].long()], sc[t, s][want[:m]], atol=1e-5), f"iter order ray {r}"
+                assert torch.all(v[r, :m][1:] <= v[r, :m][:-1] + 1e-6), f"iter not descending ray {r}"
+                ok += 1
+        report.append(f"E={E} polar_iter k={k}: {ok} rays return the exact top-k above tau in descending order")
+    idx.set_geometry(1)
+
     # fan scene (legacy): top-k of its hits vs exact top-k positive
     idx.set_geometry(0)
     k = 16

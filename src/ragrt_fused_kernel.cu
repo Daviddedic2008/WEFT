@@ -71,6 +71,7 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
     int* __restrict__ d_task_qt, int64_t* __restrict__ d_task_offset,
     int* __restrict__ d_task_length, float* __restrict__ d_task_base_score,
     unsigned long long* __restrict__ d_task_start, unsigned long long* __restrict__ d_total_postings,
+    const int* __restrict__ prim_eid, int E,
     unsigned long long* __restrict__ stats
 ) {
     __shared__ int   s_top_eid[WARPS_PER_BLOCK][S2_MAX_EIDS];
@@ -104,8 +105,12 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
     int64_t base_hit = (int64_t)warp_id * max_hits;
 
     // 1. Load the hits into shared memory
+    // Polar scene hits are norm-sorted primitive indices: map to codeword ids here
+    // (parallel over lanes, instead of a dependent load inside every any-hit call).
+    const int* pmap = prim_eid ? prim_eid + (int64_t)s * E : nullptr;
     for (int i = lane_id; i < n_hits; i += 32) {
-        s_hits_eid[warp_in_block][i] = out_c[base_hit + i];
+        int c = out_c[base_hit + i];
+        s_hits_eid[warp_in_block][i] = (pmap && c >= 0) ? pmap[c] : c;
         s_hits_val[warp_in_block][i] = out_v[base_hit + i];
     }
     for (int i = n_hits + lane_id; i < S2_MAX_HITS; i += 32) {
@@ -681,6 +686,7 @@ extern "C" void ragrt_stage2(
     int total_rays, int max_hits, int k_eids, int k_cent, int ntok, int num_centroids,
     const int64_t* d_csr_row_ptrs, const void* d_csr_col_eids, int eid_bytes,
     const int64_t* d_csr_block_sums, const uint16_t* d_csr_lengths,
+    const int* d_prim_eid, int E,
     int buf_idx, cudaStream_t stream
 ) {
     ensure_task_bufs(buf_idx);
@@ -699,14 +705,14 @@ extern "C" void ragrt_stage2(
             d_csr_row_ptrs, (const uint8_t*)d_csr_col_eids, d_csr_block_sums, d_csr_lengths,
             total_rays, max_hits, k_eids, k_cent, active_ntok, num_centroids,
             B.num_tasks, B.num_dropped, B.task_qt, B.task_offset, B.task_length, B.task_base,
-            B.task_start, B.total_postings, stats_ptr());
+            B.task_start, B.total_postings, d_prim_eid, E, stats_ptr());
     } else {
         collect_posting_tasks_csr_warp_kernel<uint16_t><<<blocks, threads, 0, stream>>>(
             d_out_c, d_out_v, d_out_hit_count, d_topc, d_scores,
             d_csr_row_ptrs, (const uint16_t*)d_csr_col_eids, d_csr_block_sums, d_csr_lengths,
             total_rays, max_hits, k_eids, k_cent, active_ntok, num_centroids,
             B.num_tasks, B.num_dropped, B.task_qt, B.task_offset, B.task_length, B.task_base,
-            B.task_start, B.total_postings, stats_ptr());
+            B.task_start, B.total_postings, d_prim_eid, E, stats_ptr());
     }
     if (stats_ptr()) add_postings_stat_kernel<<<1, 1, 0, stream>>>(B.total_postings, stats_ptr());
 }

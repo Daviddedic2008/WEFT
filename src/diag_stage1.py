@@ -3,7 +3,8 @@ Does Stage 1 return the true top-k codewords, and what does it cost? (real queri
 
 For TUNE queries, per ray (query token x subspace) and per k:
   exact   : top-k positive codewords by q.c (brute force, exact)
-  polar   : top-k of the polar RT scene's hits (exact-threshold geometry)
+  polar   : top-k of the polar RT scene's hits (exact-threshold geometry, any-hit)
+  polar_iter: k nearest-hit traversals of the same scene (no hit shaders)
   fan     : top-k of the legacy fan scene's hits
 Reports the recall of the exact top-k (mean, and the share of rays with all k), hits per
 ray (the any-hit work), and the median Stage-1 time of each variant at a typical config.
@@ -48,6 +49,7 @@ def main():
     ap.add_argument("--ks", default="4,8,16,32,64")
     ap.add_argument("--rt_quantile", type=float, default=0.05)
     ap.add_argument("--tag", default="")
+    ap.add_argument("--timing_eids", type=int, default=16)
     args = ap.parse_args()
     ds = C.dataset(args.dataset)
     if args.sparse_csr_dir:
@@ -67,14 +69,14 @@ def main():
     out = {"E": eng.E, "n_queries": len(bank), "calibration": eng.calibration, "recall": {}, "timing_ms": {}}
 
     for k in ks:
-        rec = {"polar": [], "fan": []}
-        hits = {"polar": [], "fan": []}
+        rec = {"polar": [], "polar_iter": [], "fan": []}
+        hits = {"polar": [], "polar_iter": [], "fan": []}
         for Qf, n in bank:
             Q_sub, _, _ = eng.ragrt_prep(Qf, n, 1)
             qp = Q_sub.reshape(-1, 3).contiguous()
             ex_c, _, _ = X.bruteforce_stage1(qp, cw, k, 256)
             exact = ex_c[:, :k]
-            for geom, g in (("polar", 1), ("fan", 0)):
+            for geom, g in (("polar", 1), ("polar_iter", 2), ("fan", 0)):
                 idx.set_geometry(g)
                 c, v, cnt = idx.stage1_hits(Q_sub, k)
                 rec[geom].append(recall(topk_hits(c, v, cnt, k), exact))
@@ -91,8 +93,9 @@ def main():
                   f"hits/ray mean {h.mean():.1f} p95 {np.percentile(h, 95):.0f} of E={eng.E}", flush=True)
 
     # Stage-1 time at a typical config (median over queries), from the profiled search.
-    p = {"nc": 16, "eids": 16, "ndocs": 4096}
-    variants = [("polar_rt", 1, False), ("polar_cuda_threshold", 1, True), ("fan_rt", 0, False), ("exact_topk_cuda", 0, True)]
+    p = {"nc": 16, "eids": args.timing_eids, "ndocs": 4096}
+    variants = [("polar_rt", 1, False), ("polar_iter_rt", 2, False), ("polar_cuda_threshold", 1, True),
+                ("fan_rt", 0, False), ("exact_topk_cuda", 0, True)]
     for name, g, bf in variants:
         idx.set_geometry(g); eng.stage1(bf)
         ts = []
@@ -101,7 +104,7 @@ def main():
             if i >= 5:
                 ts.append(st[1])
         out["timing_ms"][name] = float(np.median(ts))
-        print(f"  stage 1 {name:<22} median {np.median(ts):.3f} ms  (nc=16 eids=16 ndocs=4096)", flush=True)
+        print(f"  stage 1 {name:<22} median {np.median(ts):.3f} ms  (nc=16 eids={args.timing_eids} ndocs=4096)", flush=True)
     idx.set_geometry(1); eng.stage1(False)
 
     os.makedirs(ds["results_dir"], exist_ok=True)

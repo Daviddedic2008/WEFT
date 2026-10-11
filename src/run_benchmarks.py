@@ -443,7 +443,7 @@ def main():
     ap.add_argument("--gt_path", default=None, help="ground truth file (default: the full one for the dataset)")
     ap.add_argument("--results_subdir", default=None, help="write results to <results>/<dataset>/<subdir> (e.g. smoke)")
     ap.add_argument("--sparse_csr_dir", default=None, help="RAGRT index dir (default: eval_config), e.g. an E-sweep index")
-    ap.add_argument("--geometry", default="polar", choices=["polar", "fan"])
+    ap.add_argument("--geometry", default="polar", choices=["polar", "polar_iter", "fan"])
     ap.add_argument("--stage3", default="sparse", choices=["sparse", "dense"])
     ap.add_argument("--rerank", default="wmma", choices=["wmma", "simt"])
     ap.add_argument("--rt_quantile", type=float, default=0.05)

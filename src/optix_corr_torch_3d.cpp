@@ -50,6 +50,7 @@ extern "C" void ragrt_stage2(const int* d_out_c, const float* d_out_v, const int
                              int total_rays, int max_hits, int k_eids, int k_cent, int ntok, int num_centroids,
                              const int64_t* d_csr_row_ptrs, const void* d_csr_col_eids, int eid_bytes,
                              const int64_t* d_csr_block_sums, const uint16_t* d_csr_lengths,
+                             const int* d_prim_eid, int E,
                              int buf_idx, cudaStream_t stream);
 extern "C" void ragrt_stage3_dense(const uint8_t* d_map_packed_24, float* d_passage_scores, int num_passages,
                                    const uint32_t* d_doc_predicates, uint32_t query_mask, int ntok,
@@ -98,6 +99,8 @@ public:
     int E = 0;
     std::vector<float> h_cb;                    // [32 * E * 3]
     float3* d_centroid_xyz = nullptr;           // [32 * E]
+    float3* d_sorted_xyz = nullptr;             // [32 * E], each subspace sorted by norm (primitive order)
+    torch::Tensor t_prim_eid;                   // same map as d_prim_eid, for stage1_hits
     int* d_prim_eid = nullptr;                  // [32 * E] norm-sorted index -> eid
     std::vector<int> h_prim_eid;
     std::vector<Gas> fan_gas;                   // [32]
@@ -151,6 +154,7 @@ public:
         d={}; d.kind=OPTIX_PROGRAM_GROUP_KIND_MISS; d.miss.module=mod; d.miss.entryFunctionName="__miss__corr_3d";
         OPTIX_CHECK(optixProgramGroupCreate(ctx,&d,1,&gopts,nullptr,nullptr,&ms_grp));
         d={}; d.kind=OPTIX_PROGRAM_GROUP_KIND_HITGROUP; d.hitgroup.moduleAH=mod; d.hitgroup.entryFunctionNameAH="__anyhit__corr_3d";
+        d.hitgroup.moduleCH=mod; d.hitgroup.entryFunctionNameCH="__closesthit__corr_3d";
         OPTIX_CHECK(optixProgramGroupCreate(ctx,&d,1,&gopts,nullptr,nullptr,&hg_grp));
 
         OptixPipelineLinkOptions plo={}; plo.maxTraceDepth=1; OptixProgramGroup groups[]={rg_grp,ms_grp,hg_grp};
@@ -215,7 +219,8 @@ public:
         free_levels();
         if (d_centroid_xyz) cudaFree(d_centroid_xyz);
         if (d_prim_eid) cudaFree(d_prim_eid);
-        d_centroid_xyz = nullptr; d_prim_eid = nullptr;
+        if (d_sorted_xyz) cudaFree(d_sorted_xyz);
+        d_centroid_xyz = nullptr; d_prim_eid = nullptr; d_sorted_xyz = nullptr;
     }
 
     Gas build_gas(const std::vector<float3>& verts, const std::vector<uint3>& indices, unsigned int geom_flags) {
@@ -279,6 +284,12 @@ public:
         }
         CUDA_CHECK(cudaMalloc(&d_prim_eid, h_prim_eid.size() * sizeof(int)));
         CUDA_CHECK(cudaMemcpy(d_prim_eid, h_prim_eid.data(), h_prim_eid.size() * sizeof(int), cudaMemcpyHostToDevice));
+        t_prim_eid = torch::from_blob(h_prim_eid.data(), {(int64_t)h_prim_eid.size()}, torch::kInt32).to(torch::kInt64).to(torch::kCUDA);
+        std::vector<float3> h_sorted(S * E);
+        for (int s = 0; s < S; ++s)
+            for (int i = 0; i < E; ++i) h_sorted[s * E + i] = h_xyz[s * E + h_prim_eid[s * E + i]];
+        CUDA_CHECK(cudaMalloc(&d_sorted_xyz, h_sorted.size() * sizeof(float3)));
+        CUDA_CHECK(cudaMemcpy(d_sorted_xyz, h_sorted.data(), h_sorted.size() * sizeof(float3), cudaMemcpyHostToDevice));
 
         constexpr float PI = 3.14159265358979323846f;
         fan_gas.resize(S);
@@ -384,15 +395,22 @@ public:
     }
 
     void set_geometry(int g) {
-        TORCH_CHECK(g == GEOM_FAN || g == GEOM_POLAR, "geometry must be 0 (fan) or 1 (polar)");
+        TORCH_CHECK(g == GEOM_FAN || g == GEOM_POLAR || g == GEOM_POLAR_ITER,
+                    "geometry must be 0 (fan), 1 (polar) or 2 (polar_iter)");
         geometry = g;
+    }
+    bool polar_scene() const { return geometry == GEOM_POLAR || geometry == GEOM_POLAR_ITER; }
+    // Stage-1 hit ids are norm-sorted primitive indices (mapped to eids in Stage 2) when they come
+    // from the polar scene or its threshold-scan twin; the fan scene and the exact top-k scan give eids.
+    bool hits_are_prims() const {
+        return geometry == GEOM_POLAR || (geometry == GEOM_POLAR_ITER && stage1_mode == 0);
     }
     void set_stage1_mode(int mode) {
         TORCH_CHECK(mode == 0 || mode == 1, "stage1 mode must be 0 (RT) or 1 (CUDA cores)");
         stage1_mode = mode;
     }
     void set_stage3_sparse(bool on) { stage3_sparse = on ? 1 : 0; }
-    int max_hits() const { return geometry == GEOM_POLAR ? MAX_HITS_CAP : FAN_MAX_HITS; }
+    int max_hits() const { return polar_scene() ? MAX_HITS_CAP : FAN_MAX_HITS; }
 
     // ------------------------------------------------------------------ binding
     void ensure_cand_capacity(int required_cands) {
@@ -447,8 +465,9 @@ public:
     }
 
     // ------------------------------------------------------------------ stages
-    void fill_params(CorrParams3D& p, const float* qp, int buf, int level) {
+    void fill_params(CorrParams3D& p, const float* qp, int buf, int level, int k_eids) {
         p = {};
+        p.k_iter = k_eids;
         p.query_points = (float3*)qp;
         p.geometry = geometry;
         p.num_entries = E;
@@ -456,7 +475,7 @@ public:
         p.centroid_xyz = d_centroid_xyz;
         p.prim_eid = d_prim_eid;
         for (int s = 0; s < NUM_3D_SUBSPACES; ++s) {
-            if (geometry == GEOM_POLAR) {
+            if (polar_scene()) {
                 p.subspace_gas[s] = level_gas[level][s].handle;
                 p.tmax[s] = 1.0f / level_tau[level][s];
             } else {
@@ -475,7 +494,8 @@ public:
         if (stage1_mode == 0) {
             OPTIX_CHECK(optixLaunch(pipe, stream, d_params, sizeof(CorrParams3D), &sbt, total_rays, 1, 1));
         } else if (geometry == GEOM_POLAR) {
-            launch_threshold_stage1(qp, (const float*)d_centroid_xyz, d_level_tau + level * NUM_3D_SUBSPACES,
+            // Same threshold over the norm-sorted codebook, so it also returns primitive indices.
+            launch_threshold_stage1(qp, (const float*)d_sorted_xyz, d_level_tau + level * NUM_3D_SUBSPACES,
                                     total_rays, E, p.max_hits, p.out_hit_centroid, p.out_hit_value,
                                     p.out_hit_count, stream);
         } else {
@@ -492,7 +512,8 @@ public:
         ragrt_stage2(buf_out_c[buf].data_ptr<int>(), buf_out_v[buf].data_ptr<float>(), buf_out_n[buf].data_ptr<int>(),
                      topc, scores, total_rays, max_hits(), k_eids, k_cent, nq, b_num_centroids,
                      b_csr_row_ptrs.data_ptr<int64_t>(), b_csr_col_eids.data_ptr(), b_eid_bytes,
-                     b_csr_block_sums.data_ptr<int64_t>(), (const uint16_t*)b_csr_lengths.data_ptr(), buf, stream);
+                     b_csr_block_sums.data_ptr<int64_t>(), (const uint16_t*)b_csr_lengths.data_ptr(),
+                     hits_are_prims() ? d_prim_eid : nullptr, E, buf, stream);
         if (ev_after_s2) CUDA_CHECK(cudaEventRecord(ev_after_s2, stream));
         auto cand = d_candidate_pids[buf].slice(0, 0, k_candidates);
         auto approx = d_cand_approx[buf].slice(0, 0, k_candidates);
@@ -546,7 +567,7 @@ public:
         ensure_cand_capacity(k_candidates);
     }
 
-    int level_or_zero(int k_eids) { return geometry == GEOM_POLAR ? level_for(k_eids) : 0; }
+    int level_or_zero(int k_eids) { return polar_scene() ? level_for(k_eids) : 0; }
 
     torch::Tensor search_single_query_native(
         torch::Tensor Q_full_128_fp32, torch::Tensor Q_full_fp16, torch::Tensor Q_sub3d, torch::Tensor topc, torch::Tensor scores,
@@ -558,7 +579,7 @@ public:
         int total_rays = nq * NUM_3D_SUBSPACES;
         auto qp = Q_sub3d.reshape({total_rays, 3}).contiguous();
         int level = level_or_zero(k_eids);
-        CorrParams3D p; fill_params(p, qp.data_ptr<float>(), 0, level);
+        CorrParams3D p; fill_params(p, qp.data_ptr<float>(), 0, level, k_eids);
         if (stage1_mode == 0) CUDA_CHECK(cudaMemcpyAsync(d_p_single, &p, sizeof(p), cudaMemcpyHostToDevice, stream));
         run_stage1(p, (CUdeviceptr)d_p_single, qp.data_ptr<float>(), total_rays, k_eids, level, stream);
         stages23(topc.data_ptr<int>(), scores.data_ptr<float>(), nq, k_cent, k_candidates, query_mask, k_eids, 0, stream, nullptr);
@@ -575,7 +596,7 @@ public:
         int total_rays = nq * NUM_3D_SUBSPACES;
         auto qp = Q_sub3d.reshape({total_rays, 3}).contiguous();
         int level = level_or_zero(k_eids);
-        CorrParams3D p; fill_params(p, qp.data_ptr<float>(), 0, level);
+        CorrParams3D p; fill_params(p, qp.data_ptr<float>(), 0, level, k_eids);
         if (stage1_mode == 0) CUDA_CHECK(cudaMemcpyAsync(d_p_single, &p, sizeof(p), cudaMemcpyHostToDevice, stream));
 
         cudaEvent_t ev[5];
@@ -613,7 +634,7 @@ public:
         std::vector<CorrParams3D> h_params_all(num_queries);
         for (int i = 0; i < num_queries; ++i) {
             qps[i] = Q_sub3d_list[i].reshape({-1, 3}).contiguous();
-            fill_params(h_params_all[i], qps[i].data_ptr<float>(), i % 2, level);
+            fill_params(h_params_all[i], qps[i].data_ptr<float>(), i % 2, level, k_eids);
         }
         auto d_params_batch = torch::empty({num_queries * (int64_t)sizeof(CorrParams3D)},
             torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
@@ -662,12 +683,18 @@ public:
         int total_rays = nq * NUM_3D_SUBSPACES;
         auto qp = Q_sub3d.reshape({total_rays, 3}).to(torch::kFloat32).contiguous();
         int level = level_or_zero(k_eids);
-        CorrParams3D p; fill_params(p, qp.data_ptr<float>(), 0, level);
+        CorrParams3D p; fill_params(p, qp.data_ptr<float>(), 0, level, k_eids);
         buf_out_c[0].fill_(-1); buf_out_v[0].zero_();
         if (stage1_mode == 0) CUDA_CHECK(cudaMemcpyAsync(d_p_single, &p, sizeof(p), cudaMemcpyHostToDevice, stream));
         run_stage1(p, (CUdeviceptr)d_p_single, qp.data_ptr<float>(), total_rays, k_eids, level, stream);
         int mh = max_hits();
         auto c = buf_out_c[0].view({-1}).slice(0, 0, (int64_t)total_rays * mh).view({total_rays, mh}).clone();
+        if (hits_are_prims()) {   // report eids, like every other mode
+            auto sub = (torch::arange(total_rays, c.options().dtype(torch::kInt64)) % NUM_3D_SUBSPACES).unsqueeze(1) * E;
+            auto valid = c >= 0;
+            auto mapped = t_prim_eid.index({(sub + c.clamp_min(0).to(torch::kInt64)).view({-1})}).view({total_rays, mh}).to(torch::kInt32);
+            c = torch::where(valid, mapped, c);
+        }
         auto v = buf_out_v[0].view({-1}).slice(0, 0, (int64_t)total_rays * mh).view({total_rays, mh}).clone();
         auto n = buf_out_n[0].slice(0, 0, total_rays).clone();
         return {c, v, n};
@@ -682,7 +709,7 @@ public:
         int total_rays = nq * NUM_3D_SUBSPACES;
         auto qp = Q_sub3d.reshape({total_rays, 3}).contiguous();
         int level = level_or_zero(k_eids);
-        CorrParams3D p; fill_params(p, qp.data_ptr<float>(), 0, level);
+        CorrParams3D p; fill_params(p, qp.data_ptr<float>(), 0, level, k_eids);
         if (stage1_mode == 0) CUDA_CHECK(cudaMemcpyAsync(d_p_single, &p, sizeof(p), cudaMemcpyHostToDevice, stream));
         run_stage1(p, (CUdeviceptr)d_p_single, qp.data_ptr<float>(), total_rays, k_eids, level, stream);
         stages23(topc.data_ptr<int>(), scores.data_ptr<float>(), nq, k_cent, k_candidates, query_mask, k_eids, 0, stream, nullptr);
@@ -692,7 +719,7 @@ public:
     pybind11::dict info() {
         pybind11::dict d;
         d["num_entries"] = E;
-        d["geometry"] = geometry == GEOM_POLAR ? "polar" : "fan";
+        d["geometry"] = geometry == GEOM_POLAR ? "polar" : (geometry == GEOM_POLAR_ITER ? "polar_iter" : "fan");
         d["stage1"] = stage1_mode == 0 ? "rt" : "cuda_cores";
         d["stage3"] = stage3_sparse ? "sparse" : "dense";
         d["rerank"] = ragrt_get_rerank_mode() == 1 ? "wmma" : "simt";
@@ -755,7 +782,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              "Exact-threshold scenes: taus [L, 32] on unit-query . codeword, ks[l] = k_eids level l serves")
         .def("level_for", &CorrIndex3D::level_for)
         .def("bind_index", &CorrIndex3D::bind_index)
-        .def("set_geometry", &CorrIndex3D::set_geometry, pybind11::arg("geometry"), "0 = fan (legacy), 1 = polar (exact threshold)")
+        .def("set_geometry", &CorrIndex3D::set_geometry, pybind11::arg("geometry"), "0 = fan (legacy), 1 = polar (exact threshold, any-hit), 2 = polar_iter (k nearest-hit traversals, no hit shaders)")
         .def("set_stage1_mode", &CorrIndex3D::set_stage1_mode, pybind11::arg("mode"),
              "0 = OptiX RT cores, 1 = CUDA cores (fan: exact top-k; polar: same threshold, linear scan)")
         .def("set_stage3_sparse", &CorrIndex3D::set_stage3_sparse, pybind11::arg("sparse"))

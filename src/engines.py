@@ -15,6 +15,8 @@ RAGRT options (Engines(..., geometry=, stage3=, rerank=, rt_quantile=)):
             (calibrate()): the rt_quantile quantile of the k-th best d.c, so ~(1 - q) of
             rays get at least k hits. "fan": the original scene (hits ~every codeword with
             d.c > 0, any-hit computes the exact value; RT acts as a half-space filter).
+            "polar_iter": the polar scene without hit shaders: k nearest-hit traversals per
+            ray (optixTraverse; nearest = best score), exact top-k in descending order.
   stage3    "sparse" (default): sort only the touched postings. "dense": ntok x N table.
   rerank    "wmma" (default): tensor-core TileMaxSim. "simt": the original kernel.
             Applies to every engine that uses TileMaxSim (ptms too).
@@ -63,7 +65,7 @@ RT_LEVELS = (4, 8, 16, 32, 64, 128)     # k_eids values the polar scene is calib
 class Engines:
     def __init__(self, ds, load_ragrt=True, geometry="polar", stage3="sparse", rerank="wmma",
                  rt_quantile=0.05, rt_levels=RT_LEVELS):
-        assert geometry in ("polar", "fan") and stage3 in ("sparse", "dense") and rerank in ("wmma", "simt")
+        assert geometry in ("polar", "polar_iter", "fan") and stage3 in ("sparse", "dense") and rerank in ("wmma", "simt")
         self.ds = ds
         self.geometry, self.stage3, self.rerank, self.rt_quantile = geometry, stage3, rerank, rt_quantile
         self.rt_levels = tuple(rt_levels)
@@ -108,7 +110,7 @@ class Engines:
             eids = eids.view(np.int16)          # same bytes; the kernel reads them as uint16
         self.index = rtrag_corr_3d.CorrIndex3D(C.PTX_PATH)
         self.index.build(self.CB, 0.95, 4)
-        self.index.set_geometry(1 if self.geometry == "polar" else 0)
+        self.index.set_geometry({"fan": 0, "polar": 1, "polar_iter": 2}[self.geometry])
         self.index.set_stage3_sparse(self.stage3 == "sparse")
         self.CB = self.CB.cuda()
         self.index.bind_index(
@@ -129,7 +131,7 @@ class Engines:
         (use TUNE queries). For level k: tau_s = the `quantile` quantile, over rays, of the
         k-th largest unit-query . codeword in subspace s, clamped to [0.02, 0.999] x max|c_s|.
         """
-        if self.index is None or self.geometry != "polar":
+        if self.index is None or self.geometry == "fan":
             return None
         q = self.rt_quantile if quantile is None else quantile
         X = torch.cat([torch.nn.functional.normalize(Qf[:n].float() @ self.R, p=2, dim=-1).view(n, L.NUM_SUBSPACES, 3)
@@ -170,7 +172,7 @@ class Engines:
         return self.calibrate([self.encode(text[q]) for q in tune[:n]])
 
     def ensure_calibrated(self):
-        if self.index is not None and self.geometry == "polar" and self.calibration is None:
+        if self.index is not None and self.geometry != "fan" and self.calibration is None:
             print("  calibrating polar thresholds on TUNE queries", flush=True)
             self.calibrate_from_questions()
 
