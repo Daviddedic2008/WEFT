@@ -215,8 +215,9 @@ def test_stage3(E, seed=0):
     return idx, bind
 
 
-def test_codeword_weight(E=200, seed=3):
+def test_codeword_weight(E=128, seed=3):
     """
+    (E = 128: the fan-geometry scene used here caps all-codewords mode at 128 hits per ray.)
     Codeword weight 0 + all-codewords Stage 1 (the ragrt_ivf engine) must equal centroid
     interaction: per query token t, max over its probed centroids c that the passage has a
     token in, of scores[t, c]; summed over t. (Every token here is active in some subspace.)
