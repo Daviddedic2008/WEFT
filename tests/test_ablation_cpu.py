@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import ragrt_index_lib as L
 from build_plain_ivf import plain_ivf_csr
 import muvera_fde as M
+from weft_prep import native_prep, imputed_passage_scores
 
 
 def test_plain_ivf(max_len, seed=0):
@@ -72,9 +73,37 @@ def test_muvera_tracks_chamfer():
     assert corr[5] > corr[0] + 0.05 and corr[5] > 0.5, corr
 
 
+def test_native_prep_and_imputation(seed=0):
+    g = torch.Generator().manual_seed(seed)
+    Q = torch.nn.functional.normalize(torch.randn(12, 128, generator=g), dim=-1)
+    C = torch.nn.functional.normalize(torch.randn(500, 128, generator=g), dim=-1)
+    nc = 7
+    topc, s, m = native_prep(Q, C, nc, impute=False)
+    full = Q @ C.T
+    assert m is None and torch.allclose(s, full, atol=1e-6)
+    assert torch.equal(topc.long(), full.topk(nc, dim=-1).indices)
+    topc2, s2, m2 = native_prep(Q, C, nc, impute=True)
+    assert torch.equal(topc2, topc)
+    assert torch.allclose(m2, full.topk(nc + 1, dim=-1).values[:, nc])
+    assert torch.allclose(s2, full - m2[:, None], atol=1e-6)
+    probed = torch.gather(s2, 1, topc2.long())
+    assert (probed >= -1e-6).all(), "probed centroids must have non-negative shifted scores"
+    # ranking by the shifted, found-only sum == ranking by the imputed sum
+    P = 300
+    found = torch.rand(P, 12, generator=g) < 0.4
+    best = torch.where(found, m2[None, :] + torch.rand(P, 12, generator=g), torch.zeros(P, 12))
+    imputed = imputed_passage_scores(best, found, m2)
+    shifted = torch.where(found, best - m2[None, :], torch.zeros(P, 12)).sum(1)
+    assert torch.allclose(imputed - shifted, m2.sum().expand(P), atol=1e-4)
+    assert torch.equal(torch.argsort(imputed, descending=True, stable=True),
+                       torch.argsort(shifted, descending=True, stable=True))
+    print("  native 128D prep matches Q.C^T; imputation shift is rank-equivalent to WARP-style imputation")
+
+
 if __name__ == "__main__":
     test_plain_ivf(max_len=65535)
     test_plain_ivf(max_len=5)            # forces multi-chunk centroids
     test_muvera_matches_reference()
     test_muvera_tracks_chamfer()
+    test_native_prep_and_imputation()
     print("ABLATION CPU TESTS PASSED")

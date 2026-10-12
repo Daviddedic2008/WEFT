@@ -31,7 +31,7 @@ RNG = np.random.default_rng(0)
 DOCS = torch.tensor(RNG.normal(size=(N_DOCS, DIM)), dtype=torch.float32)
 
 
-FAKE_RAGRT = ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf")
+FAKE_RAGRT = ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft", "weft_noimpute")
 
 
 def cfg_key(engine, p):
@@ -216,13 +216,14 @@ def main():
     sys.argv = ["run_benchmarks.py", "--dataset", "msmarco", "--quick", "--tune_size", "60",
                 "--results_subdir", "ivf", "--sparse_csr_dir", C.DATASETS["msmarco"]["sparse_csr_dir"],
                 "--baseline_from", src, "--import_engines", "plaid,ptms,ragrt,ragrt_bf,ragrt_nofilter,ragrt_centroid",
-                "--engines", "ragrt,ragrt_ivf", "--stages", "sweep,select,test",
+                "--engines", "ragrt,ragrt_ivf,weft,weft_noimpute", "--stages", "sweep,select,test",
                 "--repeats", "1", "--targets", "0.5,0.9"]
     run_benchmarks.main()
     R3 = json.load(open(os.path.join(src, "ivf", "results.json")))
     assert R3["sweep"]["ragrt"] == R["sweep"]["ragrt"], "ragrt must be imported, not rerun on the IVF index"
     steps = {(a["slow"], a["fast"]) for a in R3["comparisons"]["plaid_default"]["attribution"]}
-    assert {("ptms", "ragrt_ivf"), ("ragrt_ivf", "ragrt_nofilter"), ("ragrt_ivf", "ragrt_bf")} <= steps, steps
+    assert {("ptms", "ragrt_ivf"), ("ragrt_ivf", "ragrt_nofilter"), ("ragrt_ivf", "ragrt_bf"),
+            ("ragrt_ivf", "weft_noimpute"), ("weft_noimpute", "weft"), ("ptms", "weft")} <= steps, steps
     sys.argv = ["plot_results.py", "--dataset", "msmarco", "--results_subdir", "ivf"]
     import plot_results
     plot_results.main()

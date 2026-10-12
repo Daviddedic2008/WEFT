@@ -9,6 +9,10 @@
 
 Paths live in `eval_config.py`. CPU tests: `tests/test_index_lib.py`, `tests/test_eval_lib.py`, `tests/test_harness_smoke.py`, `tests/test_builder_cpu.py`, `tests/test_ablation_cpu.py`. GPU tests (after building): `tests/test_gpu_kernels.py`, `tests/test_stage1_gpu.py`.
 
+## Main engine: WEFT (plain IVF on the RAGRT kernels)
+
+The ablations showed the RT core and the subspace codebooks both cost time: plain IVF on the same Stage 2/3/4 kernels is faster at every recall target and needs 0.56 GB of lists instead of about 8 GB (LoTTE). `weft` = that engine plus native 128D fp16 centroid scores and missing-score imputation (`weft_prep.py`), on an index from `build_plain_ivf.py`. Run: `run_attribution.sh <dataset> <base> weft`; MS MARCO: `run_msmarco.sh`. The codebook and RT engines stay for the negative-result section.
+
 ## RAGRT stages and options
 
 - Stage 1 (`--geometry`): `polar` (default) puts codeword c on the plane x·c = 1 (one triangle per codeword); a ray from the origin along the unit query slice d hits it at t = 1/(d·c), so tmax = 1/τ returns exactly the codewords with d·c ≥ τ. τ is calibrated per subspace and per k level on TUNE queries (`--rt_quantile`). `fan` is the original scene (hits about every codeword with d·c > 0; RT acts as a half-space filter).

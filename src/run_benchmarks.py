@@ -50,7 +50,7 @@ import rtrag_corr_3d
 
 CORE = ["plaid", "ptms", "ragrt"]          # the primary operating point must be reachable by these
 # ablations: no-RT Stage 1; codebook filter off; no codeword score; plain IVF on RAGRT kernels; MUVERA
-ENGINES = CORE + ["ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "muvera"]
+ENGINES = CORE + ["ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft_noimpute", "weft", "muvera"]
 # (slow, fast, what the step from slow to fast changes); ratio = latency(slow) / latency(fast)
 ATTRIBUTION = [
     ("ptms", "ragrt_ivf", "engine: PLAID candidate generation -> same algorithm on RAGRT kernels"),
@@ -60,6 +60,10 @@ ATTRIBUTION = [
     ("ragrt_ivf", "ragrt_bf", "subspace codebooks overall (score + filter)"),
     ("ragrt_bf", "ragrt", "RT cores for Stage 1"),
     ("ptms", "ragrt_bf", "everything except RT"),
+    ("ragrt_ivf", "weft_noimpute", "native 128D fp16 centroid scores (no SVD projection)"),
+    ("weft_noimpute", "weft", "missing-score imputation"),
+    ("ptms", "weft", "WEFT vs PLAID+TMS"),
+    ("ragrt", "weft", "WEFT vs the original RT design"),
     ("muvera", "ragrt_bf", "RAGRT (no RT) vs MUVERA"),
 ]
 DEFAULT_ENGINES = CORE + ["ragrt_bf"]
@@ -232,6 +236,7 @@ class Bench:
         nof = NOFILTER_GRID[:2] if self.args.quick else NOFILTER_GRID
         grids = {"plaid": plaid_grid, "ptms": plaid_grid, "ragrt": ragrt_grid, "ragrt_bf": ragrt_grid,
                  "ragrt_nofilter": nof, "ragrt_centroid": ragrt_grid, "ragrt_ivf": nof,
+                 "weft": nof, "weft_noimpute": nof,
                  "muvera": MUVERA_GRID[:2] if self.args.quick else MUVERA_GRID}
         if PLAID_DEFAULT_K100 not in grids["plaid"]:
             grids["plaid"] = grids["plaid"] + [PLAID_DEFAULT_K100]
@@ -271,7 +276,8 @@ class Bench:
         self.R["selection"] = sel
         # Primary point: PLAID's own k=100 default quality if every engine reaches it on TUNE,
         # else the highest target that all three reach (MS MARCO: RAGRT tops out just below it).
-        reached = [n for n, v in sel.items() if all(v.get(e) for e in CORE)]
+        core = self.args.core or CORE
+        reached = [n for n, v in sel.items() if all(v.get(e) for e in core)]
         if "plaid_default" in reached:
             primary = "plaid_default"
         elif reached:
@@ -312,7 +318,7 @@ class Bench:
                     c[engine] = test[f"{engine}|{s[engine]['key']}"]
             if "ragrt" in c:
                 rk = f"ragrt|{s['ragrt']['key']}"
-                for base in ("plaid", "ptms", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "muvera"):
+                for base in ("plaid", "ptms", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft", "muvera"):
                     if base in c:
                         bk = f"{base}|{s[base]['key']}"
                         c[f"speedup_vs_{base}"] = c[base]["lat"]["median"] / c["ragrt"]["lat"]["median"]
@@ -579,6 +585,8 @@ def main():
     ap.add_argument("--baseline_from", default=None, help="results dir whose results to import (see --import_engines)")
     ap.add_argument("--import_engines", type=lambda s: s.split(","), default=["plaid", "ptms"],
                     help="engines imported with --baseline_from (they are not rerun), e.g. plaid,ptms,ragrt,ragrt_bf")
+    ap.add_argument("--core", type=lambda s: s.split(","), default=None,
+                    help="engines that must reach the primary operating point (default plaid,ptms,ragrt), e.g. plaid,ptms,weft")
     ap.add_argument("--muvera_dir", default=None, help="FDE dir from build_muvera_fde.py (engine muvera)")
     args = ap.parse_args()
     if args.baseline_from:

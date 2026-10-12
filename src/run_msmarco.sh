@@ -5,7 +5,8 @@
 set -euo pipefail
 export PYTHONUNBUFFERED=1
 cd "$(dirname "$0")"
-STEPS="${*:-check index gt bench attribution}"
+STEPS="${*:-check ivf gt bench}"
+SCR=/local/scratch/a/cashman3
 ROOT="${RAGRT_RESULTS:-/local/scratch/a/cashman3/ragrt_results}/msmarco"
 CSR=$(python3 -c "import eval_config as C; print(C.dataset('msmarco')['sparse_csr_dir'])")
 INDEX=$(python3 -c "import eval_config as C; print(C.dataset('msmarco')['index'])")
@@ -40,12 +41,18 @@ PY
       fi ;;
     gt)
       python3 build_ground_truth.py --dataset msmarco ;;     # resumes; a no-op when complete
-    bench)
-      python3 run_benchmarks.py --dataset msmarco --results_subdir "$SUB" \
-          --engines plaid,ptms,ragrt,ragrt_bf,ragrt_nofilter
+    ivf)   # plain-IVF index (WEFT's index): ~0.7 deduplicated postings per token, a few GB
+      [ -f "$SCR/msmarco_plain_ivf/csr_packed_24.npy" ] || python3 build_plain_ivf.py --index "$INDEX" \
+          --collection "$(python3 -c "import eval_config as C; print(C.dataset('msmarco')['collection'])")" \
+          --src_dir "$CSR" --outdir "$SCR/msmarco_plain_ivf"
+      python3 check_index.py "$SCR/msmarco_plain_ivf" ;;
+    bench)  # main comparison on the plain-IVF index: PLAID, PLAID+TMS, WEFT and its ablations
+      python3 run_benchmarks.py --dataset msmarco --results_subdir "$SUB" --sparse_csr_dir "$SCR/msmarco_plain_ivf" \
+          --engines plaid,ptms,ragrt_ivf,weft_noimpute,weft --core plaid,ptms,weft
       python3 plot_results.py --dataset msmarco --results_subdir "$SUB" ;;
-    attribution)
-      ./run_attribution.sh msmarco "$SUB" centroid profile ivf ;;
+    rt)     # optional: the codebook/RT engines on the codebook index (the negative result on a second corpus)
+      python3 run_benchmarks.py --dataset msmarco --results_subdir "${SUB}_rt" --baseline_from "$ROOT/$SUB" \
+          --engines ragrt,ragrt_bf --core plaid,ptms,ragrt ;;
     *) echo "unknown step $st"; exit 1 ;;
   esac
 done

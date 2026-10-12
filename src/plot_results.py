@@ -27,8 +27,11 @@ STYLE = {
     "ragrt_centroid": {"color": "#7a5195", "marker": "P", "label": "RAGRT, no codeword score"},
     "ragrt_ivf": {"color": "#5f6b6d", "marker": "X", "label": "Plain IVF on RAGRT kernels"},
     "muvera": {"color": "#c2185b", "marker": "*", "label": "MUVERA (FDE + TMS)"},
+    "weft_noimpute": {"color": "#0e7c86", "marker": "h", "label": "WEFT, no imputation"},
+    "weft": {"color": "#1b1b8f", "marker": "p", "label": "WEFT (plain IVF, native prep, imputation)"},
 }
-ALL_ENGINES = ["plaid", "ptms", "ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "muvera"]
+ALL_ENGINES = ["plaid", "ptms", "ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf",
+               "weft_noimpute", "weft", "muvera"]
 ENGINES = ALL_ENGINES          # narrowed in main() to the engines present in results.json
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 
@@ -114,7 +117,8 @@ def fig_breakdown(R, out):
         bars.append(("MUVERA", [("FDE MIPS", b["muvera"]["s1_3"]), ("Stage 4 TMS", b["muvera"]["s4"])]))
     for e, name, s1 in (("ragrt", "RAGRT", "1 RT"), ("ragrt_bf", "RAGRT no-RT", "1 brute"),
                         ("ragrt_nofilter", "filter off", "1 all"), ("ragrt_centroid", "no codeword score", "1 brute"),
-                        ("ragrt_ivf", "plain IVF, RAGRT kernels", "1 all")):
+                        ("ragrt_ivf", "plain IVF, RAGRT kernels", "1 all"),
+                        ("weft_noimpute", "WEFT, no imputation", "1 all"), ("weft", "WEFT", "1 all")):
         if e in b:
             r = b[e]
             bars.append((name, [("0b prep", r["s0b_prep"]), (s1, r["s1_rt"]), ("2 gather", r["s2_gather"]),
@@ -205,7 +209,7 @@ def fig_throughput(R, out):
         if k in T:
             ax.axhline(T[k], color=STYLE[e]["color"], linewidth=1.5, linestyle="--")
             ax.text(1, T[k], f" {STYLE[e]['label']} sequential {T[k]:.0f} QPS", va="bottom", fontsize=8, color=INK2)
-    for e in ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf"):
+    for e in ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft_noimpute", "weft"):
         k = f"{e}_pipelined_qps"
         if k in T:
             B = sorted(int(b) for b in T[k])

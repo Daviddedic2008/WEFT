@@ -17,6 +17,10 @@ The three retrieval engines behind one interface, for benchmarks and profiling.
              plain-IVF index (build_plain_ivf.py: one list per centroid, deduplicated pids),
              so it is PLAID's candidate generation (centroid interaction) run on RAGRT's
              kernels. ptms vs this isolates the engine; this vs ragrt_bf isolates the codebooks.
+  weft     : the plain-IVF engine with the two cheap improvements: Stage 0b centroid scores from
+             one fp16 GEMM in the native 128 dimensions (no SVD projection), and WARP-style
+             missing-score imputation (weft_prep.py). Run on a build_plain_ivf.py index.
+  weft_noimpute : weft without the imputation (isolates it; ragrt_ivf vs this isolates the prep).
   muvera   : MUVERA fixed-dimensional encodings (build_muvera_fde.py), exact GPU inner
              product over all passages, then the same TileMaxSim rerank. Grid: cands.
 
@@ -52,6 +56,7 @@ from colbert.search.strided_tensor import StridedTensor
 from colbert.modeling.colbert import colbert_score_reduce
 import rtrag_corr_3d
 import ragrt_index_lib as L
+from weft_prep import native_prep
 
 NEG_INF = float("-inf")
 
@@ -64,11 +69,14 @@ def ragrt_cfg_key(p):
     return f"nc={p['nc']} eids={p['eids']} ndocs={p['ndocs']}"
 
 
-RAGRT_ENGINES = ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf")
+RAGRT_ENGINES = ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft", "weft_noimpute")
 STAGE1_MODE = {"ragrt": 0, "ragrt_bf": 1, "ragrt_nofilter": 2,      # see CorrIndex3D.set_stage1_mode
-               "ragrt_centroid": 1, "ragrt_ivf": 2}
+               "ragrt_centroid": 1, "ragrt_ivf": 2, "weft": 2, "weft_noimpute": 2}
 CODEWORD_WEIGHT = {"ragrt": 1.0, "ragrt_bf": 1.0, "ragrt_nofilter": 1.0,   # weight of q_s.w in Stage 2
-                   "ragrt_centroid": 0.0, "ragrt_ivf": 0.0}
+                   "ragrt_centroid": 0.0, "ragrt_ivf": 0.0, "weft": 0.0, "weft_noimpute": 0.0}
+# Stage 0b: "svd96" = centroid scores in the 96D SVD space (codebook engines); "native" = fp16 GEMM
+# against the 128D ColBERT centroids; impute = missing-score imputation (weft_prep.py).
+PREP = {"weft": ("native", True), "weft_noimpute": ("native", False)}
 
 
 def muvera_cfg_key(p):
@@ -116,6 +124,7 @@ class Engines:
         self.pred_np = pred.astype(np.uint32)
         self.pred_gpu = torch.from_numpy(self.pred_np.astype(np.int64)).cuda()
 
+        self.prep_mode = ("svd96", False)
         self.index = None
         if load_ragrt:
             self._load_ragrt()
@@ -278,9 +287,14 @@ class Engines:
     # ------------------------------------------------------------ RAGRT
     @torch.no_grad()
     def ragrt_prep(self, Qf, ntok, nc):
-        """Stage 0b: 3D sub-queries, 96D centroid scores and the top-nc centroids per token."""
+        """Stage 0b: 3D sub-queries, centroid scores and the top-nc centroids per token
+        (scores in the 96D SVD space, or native 128D fp16 with optional imputation: self.prep_mode)."""
         Q96 = torch.nn.functional.normalize(Qf[:ntok].float() @ self.R, p=2, dim=-1)
         Q_sub = Q96.view(ntok, L.NUM_SUBSPACES, L.SUBSPACE_DIM).contiguous()
+        mode, impute = self.prep_mode
+        if mode == "native":
+            topc, scores, _ = native_prep(Qf[:ntok], self.centroids_fp16, nc, impute)
+            return Q_sub, scores, topc
         scores = (Q96 @ self.C96.T).contiguous()
         topc = scores.topk(k=nc, dim=-1).indices.to(torch.int32).contiguous()
         return Q_sub, scores, topc
@@ -296,6 +310,7 @@ class Engines:
         """Set Stage 1 mode and the Stage 2 codeword weight for a RAGRT engine."""
         self.index.set_stage1_mode(STAGE1_MODE[engine])
         rtrag_corr_3d.set_codeword_weight(CODEWORD_WEIGHT[engine])
+        self.prep_mode = PREP.get(engine, ("svd96", False))
 
     def resolve(self, engine, p):
         """eids = "all" (ragrt_nofilter, ragrt_ivf) means every codeword of the index."""
