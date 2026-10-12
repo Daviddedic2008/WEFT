@@ -28,6 +28,8 @@ The three retrieval engines behind one interface, for benchmarks and profiling.
              the same exact rerank. Tests whether more precise approximate scores cut ndocs.
   weft_resid_norr : weft_resid without the rerank: the top-k by approximate score, i.e. WARP's
              pipeline (imputation + implicit decompression, no rerank) ported to the GPU.
+  weft_graph : weft run as two CUDA graph replays with one mid-query sync (graph_search.py):
+             same candidates and results as weft, less launch and sync overhead.
   muvera   : MUVERA fixed-dimensional encodings (build_muvera_fde.py), exact GPU inner
              product over all passages, then the same TileMaxSim rerank. Grid: cands.
 
@@ -63,7 +65,7 @@ from colbert.search.strided_tensor import StridedTensor
 from colbert.modeling.colbert import colbert_score_reduce
 import rtrag_corr_3d
 import ragrt_index_lib as L
-from weft_prep import native_prep, residual_lut
+from weft_prep import native_prep, residual_lut, residual_byte_weights
 
 NEG_INF = float("-inf")
 
@@ -76,7 +78,8 @@ def ragrt_cfg_key(p):
     return f"nc={p['nc']} eids={p['eids']} ndocs={p['ndocs']}"
 
 
-WEFT_ENGINES = ("weft", "weft_noimpute", "weft_tok", "weft_resid", "weft_resid_norr")
+WEFT_ENGINES = ("weft", "weft_noimpute", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph")
+GRAPH_ENGINES = ("weft_graph",)          # CUDA-graph path: no per-stage profile, no batched pipeline
 RESID_ENGINES = ("weft_resid", "weft_resid_norr")       # need a token-level index (csr_token_ids.npy)
 TOKEN_ENGINES = ("weft_tok",) + RESID_ENGINES
 RAGRT_ENGINES = ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf") + WEFT_ENGINES
@@ -90,7 +93,7 @@ CODEWORD_WEIGHT = {"ragrt": 1.0, "ragrt_bf": 1.0, "ragrt_nofilter": 1.0,   # wei
 # resid = add q.r per posting (residual LUT; token-level index only).
 PREP = {"weft": ("native", True, True, False), "weft_noimpute": ("native", False, True, False),
         "weft_tok": ("native", True, True, False), "weft_resid": ("native", True, True, True),
-        "weft_resid_norr": ("native", True, True, True)}
+        "weft_resid_norr": ("native", True, True, True), "weft_graph": ("native", True, True, False)}
 NO_PREP = ("svd96", False, False, False)
 
 
@@ -111,7 +114,7 @@ RT_LEVELS = (4, 8, 16, 32, 64, 128)     # k_eids values the polar scene is calib
 
 class Engines:
     def __init__(self, ds, load_ragrt=True, geometry="polar", stage3="sparse", rerank="wmma",
-                 rt_quantile=0.05, rt_levels=RT_LEVELS, muvera_dir=None):
+                 rt_quantile=0.05, rt_levels=RT_LEVELS, muvera_dir=None, encoder="stock"):
         assert geometry in ("polar", "polar_iter", "fan") and stage3 in ("sparse", "dense") and rerank in ("wmma", "simt")
         self.ds = ds
         self.geometry, self.stage3, self.rerank, self.rt_quantile = geometry, stage3, rerank, rt_quantile
@@ -121,6 +124,12 @@ class Engines:
         self.searcher = Searcher(index=ds["index"], collection=ds["collection"])
         self.ranker = self.searcher.ranker
         self.N = len(self.ranker.doclens)
+        assert encoder in ("stock", "fast")
+        self.encoder = encoder
+        self.fast_encoder = None
+        if encoder == "fast":
+            from fast_encoder import FastQueryEncoder
+            self.fast_encoder = FastQueryEncoder(self.searcher.checkpoint)
 
         codec = self.ranker.codec
         doclens = torch.tensor(self.ranker.doclens, dtype=torch.int32, device="cuda")
@@ -141,6 +150,9 @@ class Engines:
 
         self.prep_mode = NO_PREP
         self.has_token_ids = False
+        self.graph = None
+        self.zero_sub = None
+        self.res_wb = None
         self.index = None
         if load_ragrt:
             self._load_ragrt()
@@ -246,7 +258,7 @@ class Engines:
             self.calibrate_from_questions()
 
     def options(self):
-        d = {"geometry": self.geometry, "stage3": self.stage3, "rerank": self.rerank,
+        d = {"geometry": self.geometry, "stage3": self.stage3, "rerank": self.rerank, "encoder": self.encoder,
              "rt_quantile": self.rt_quantile, "calibration": self.calibration}
         if self.muvera is not None:
             d["muvera"] = self.muvera["cfg"]
@@ -259,6 +271,8 @@ class Engines:
     @torch.no_grad()
     def encode(self, text):
         """[32, 128] fp16 query matrix on the GPU, and the number of real tokens."""
+        if self.fast_encoder is not None:
+            return self.fast_encoder.encode(text)
         Qf = self.searcher.encode(text).squeeze(0).cuda().to(torch.float16).contiguous()
         assert Qf.shape == (32, 128), f"expected [32, 128] query, got {tuple(Qf.shape)}"
         return Qf, L.query_ntok(self.searcher, text)
@@ -311,15 +325,21 @@ class Engines:
     def ragrt_prep(self, Qf, ntok, nc):
         """Stage 0b: 3D sub-queries, centroid scores and the top-nc centroids per token
         (scores in the 96D SVD space, or native 128D fp16 with optional imputation: self.prep_mode)."""
-        Q96 = torch.nn.functional.normalize(Qf[:ntok].float() @ self.R, p=2, dim=-1)
-        Q_sub = Q96.view(ntok, L.NUM_SUBSPACES, L.SUBSPACE_DIM).contiguous()
         mode, impute, compact, resid = self.prep_mode
         if mode == "native":
+            # WEFT engines: Stage 1 is "every codeword" with codeword weight 0, so the 3D sub-queries
+            # are never used; skip the 128 -> 96 projection (zeros of the right shape).
+            if self.zero_sub is None:
+                self.zero_sub = torch.zeros(32, L.NUM_SUBSPACES, L.SUBSPACE_DIM, device="cuda")
+            Q_sub = self.zero_sub[:ntok]
             topc, scores, _ = native_prep(Qf[:ntok], self.centroids_fp16, nc, impute, compact)
             if resid:   # read by the next Stage 3 (a global in the extension; one query at a time)
-                self.index.set_residual_lut(residual_lut(Qf[:ntok], self.bucket_weights,
-                                                         self.reversed_bit_map, self.decomp_table))
+                if self.res_wb is None:
+                    self.res_wb = residual_byte_weights(self.bucket_weights, self.reversed_bit_map, self.decomp_table)
+                self.index.set_residual_lut(residual_lut(Qf[:ntok], None, None, None, wb=self.res_wb))
             return Q_sub, scores, topc
+        Q96 = torch.nn.functional.normalize(Qf[:ntok].float() @ self.R, p=2, dim=-1)
+        Q_sub = Q96.view(ntok, L.NUM_SUBSPACES, L.SUBSPACE_DIM).contiguous()
         scores = (Q96 @ self.C96.T).contiguous()
         topc = scores.topk(k=nc, dim=-1).indices.to(torch.int32).contiguous()
         return Q_sub, scores, topc
@@ -400,6 +420,13 @@ class Engines:
             [x[1] for x in preps], p["nc"], self.ndocs(p), C.TOP_K, query_mask=mask, k_eids=p["eids"])
         return out
 
+    @torch.no_grad()
+    def graph_search(self, Qf, ntok, p, mask=0):
+        if self.graph is None:
+            from graph_search import GraphSearch
+            self.graph = GraphSearch(self.index, self.centroids_fp16, C.TOP_K, impute=True)
+        return self.passes(self.graph.search(Qf, ntok, p["nc"], self.ndocs(p), p["eids"], mask), mask)
+
     # ------------------------------------------------------------ MUVERA
     @torch.no_grad()
     def muvera_candidates(self, Qf, p):
@@ -432,6 +459,8 @@ class Engines:
             try:
                 if engine == "weft_resid_norr":
                     return self.approx_topk(Qf, ntok, self.resolve(engine, p), mask)
+                if engine == "weft_graph":
+                    return self.graph_search(Qf, ntok, self.resolve(engine, p), mask)
                 return self.ragrt(Qf, ntok, self.resolve(engine, p), mask)
             finally:
                 self.use_engine("ragrt")

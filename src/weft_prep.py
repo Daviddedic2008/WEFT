@@ -47,13 +47,18 @@ def native_prep(Q, C, nc, impute=False, compact=False):
     return topc, s.float().contiguous(), None
 
 
-def residual_lut(Q, bucket_weights, reversed_bit_map, decomp_table):
-    """Q [ntok, 128] -> lut float32 [ntok, 32, 256]."""
-    w = bucket_weights.float()                                         # [4]
-    buckets = decomp_table.long()[reversed_bit_map.long()]             # [256 raw byte, 4 dims]
-    wb = w[buckets]                                                    # [256, 4]
+def residual_byte_weights(bucket_weights, reversed_bit_map, decomp_table):
+    """[256 raw byte, 4 dims]: the bucket weight each byte value decodes to (constant per index)."""
+    buckets = decomp_table.long()[reversed_bit_map.long()]             # [256, 4]
+    return bucket_weights.float()[buckets].contiguous()
+
+
+def residual_lut(Q, bucket_weights, reversed_bit_map, decomp_table, wb=None):
+    """Q [ntok, 128] -> lut float32 [ntok, 32, 256]. wb: residual_byte_weights(...), cached by the caller."""
+    if wb is None:
+        wb = residual_byte_weights(bucket_weights, reversed_bit_map, decomp_table)
     Qr = Q.float().view(Q.shape[0], 32, 4)                             # [ntok, 32 bytes, 4 dims]
-    return torch.einsum("tjk,bk->tjb", Qr, wb).contiguous()
+    return (Qr @ wb.T).contiguous()                                    # one batched GEMM
 
 
 def residual_dot_reference(q, residual_bytes, bucket_weights, reversed_bit_map, decomp_table):

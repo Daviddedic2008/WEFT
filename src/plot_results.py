@@ -32,9 +32,10 @@ STYLE = {
     "weft_tok": {"color": "#7a5195", "marker": "<", "label": "WEFT, token-level index"},
     "weft_resid": {"color": "#bc5090", "marker": ">", "label": "WEFT + residual correction"},
     "weft_resid_norr": {"color": "#ef5675", "marker": "d", "label": "WARP-style (residuals, no rerank)"},
+    "weft_graph": {"color": "#000060", "marker": "*", "label": "WEFT, CUDA graphs"},
 }
 ALL_ENGINES = ["plaid", "ptms", "ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf",
-               "weft_noimpute", "weft", "weft_tok", "weft_resid", "weft_resid_norr", "muvera"]
+               "weft_noimpute", "weft", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "muvera"]
 ENGINES = ALL_ENGINES          # narrowed in main() to the engines present in results.json
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 
@@ -128,6 +129,8 @@ def fig_breakdown(R, out):
             r = b[e]
             bars.append((name, [("0b prep", r["s0b_prep"]), (s1, r["s1_rt"]), ("2 gather", r["s2_gather"]),
                                 ("3 score", r["s3_score"]), ("4 TMS", r["s4_tms"])]))
+    if "weft_graph" in b:          # one graph per phase: no per-stage events, total only
+        bars.append(("WEFT, CUDA graphs", [("total (graph)", b["weft_graph"]["total"])]))
     if not bars:
         print("  skipping fig_breakdown (no breakdown in this run)")
         return

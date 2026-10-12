@@ -47,13 +47,13 @@ import torch
 
 import eval_config as C
 import eval_lib as E
-from engines import Engines, cfg_key, RAGRT_ENGINES, RESID_ENGINES
+from engines import Engines, cfg_key, RAGRT_ENGINES, RESID_ENGINES, GRAPH_ENGINES
 import rtrag_corr_3d
 
 CORE = ["plaid", "ptms", "ragrt"]          # the primary operating point must be reachable by these
 # ablations: no-RT Stage 1; codebook filter off; no codeword score; plain IVF on RAGRT kernels; MUVERA
 ENGINES = CORE + ["ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft_noimpute", "weft",
-                  "weft_tok", "weft_resid", "weft_resid_norr", "muvera"]
+                  "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "muvera"]
 # (slow, fast, what the step from slow to fast changes); ratio = latency(slow) / latency(fast)
 ATTRIBUTION = [
     ("ptms", "ragrt_ivf", "engine: PLAID candidate generation -> same algorithm on RAGRT kernels"),
@@ -73,6 +73,8 @@ ATTRIBUTION = [
     ("weft", "weft_resid", "residual correction overall (index + scoring)"),
     ("weft_resid", "weft_resid_norr", "drop the exact rerank"),
     ("weft", "weft_resid_norr", "WEFT vs a WARP-style GPU pipeline (no rerank)"),
+    ("weft", "weft_graph", "CUDA graphs + one sync (launch and sync overhead)"),
+    ("ptms", "weft_graph", "WEFT (graphs) vs PLAID+TMS"),
 ]
 DEFAULT_ENGINES = CORE + ["ragrt_bf"]
 PLAID_DEFAULT_K100 = {"ncells": 2, "threshold": 0.45, "ndocs": 1024}   # ColBERT Searcher defaults for k=100
@@ -123,6 +125,11 @@ class Bench:
         self.gt = {name: {q: z[name][i].tolist() for i, q in enumerate(gt_qids)} for name in self.gt_names}
 
         self.qrels = E.load_qrels(self.ds["qrels_path"])
+        cp = os.path.join(C.dataset(args.dataset)["results_dir"], "corr_filters.json")
+        self.corr = json.load(open(cp))["filters"] if os.path.exists(cp) else {}
+        missing = [f for f in self.gt_names if f.startswith("corr_") and f not in self.corr]
+        if missing:
+            sys.exit(f"FATAL: ground truth has {missing} but {cp} is missing")
         text = dict(E.load_questions(self.ds["questions_path"]))
         self.meta = json.load(open(self.ds["queries_meta_path"])) if self.ds["has_domains"] else {}
         qids = [q for q in gt_qids if q in self.qrels]
@@ -139,7 +146,7 @@ class Bench:
         extra = {"muvera_dir": args.muvera_dir} if "muvera" in self.engines else {}
         self.eng = Engines(self.ds, load_ragrt=any(e in RAGRT_ENGINES for e in self.engines),
                            geometry=args.geometry, stage3=args.stage3, rerank=args.rerank,
-                           rt_quantile=args.rt_quantile, **extra)
+                           rt_quantile=args.rt_quantile, encoder=args.encoder, **extra)
         self.bank = {}
         enc_ms = []
         need = self.tune + self.test
@@ -199,6 +206,8 @@ class Bench:
             return 0
         if filt == "own_domain":
             return 1 << (C.DOMAIN_BIT_BASE + C.LOTTE_DOMAINS.index(self.meta[q]["domain"]))
+        if filt in self.corr:                       # query-correlated topic filters (build_corr_filters.py)
+            return self.corr[filt][q]
         return dict(("syn" + l.rstrip("%"), b) for l, b in C.SYNTHETIC_MASKS)[filt]
 
     def evaluate(self, engine, p, qids, repeats=1, filt="all"):
@@ -248,7 +257,7 @@ class Bench:
         grids = {"plaid": plaid_grid, "ptms": plaid_grid, "ragrt": ragrt_grid, "ragrt_bf": ragrt_grid,
                  "ragrt_nofilter": nof, "ragrt_centroid": ragrt_grid, "ragrt_ivf": nof,
                  "weft": nof, "weft_noimpute": nof, "weft_tok": nof, "weft_resid": nof,
-                 "weft_resid_norr": NORR_GRID[:2] if self.args.quick else NORR_GRID,
+                 "weft_resid_norr": NORR_GRID[:2] if self.args.quick else NORR_GRID, "weft_graph": nof,
                  "muvera": MUVERA_GRID[:2] if self.args.quick else MUVERA_GRID}
         if PLAID_DEFAULT_K100 not in grids["plaid"]:
             grids["plaid"] = grids["plaid"] + [PLAID_DEFAULT_K100]
@@ -353,14 +362,15 @@ class Bench:
             comps[name] = c
         self.R["comparisons"] = comps
 
-    def primary(self):
+    def primary(self, engines=None):
         """Primary-point config per engine; an engine that cannot reach it (e.g. MUVERA) uses the
         highest target it does reach, recorded in R["primary_fallback"]."""
+        engines = engines or self.engines
         sel = self.R["selection"]
         s = sel[self.R["primary_target"]]
-        out = {e: s[e]["params"] for e in self.engines if s.get(e)}
+        out = {e: s[e]["params"] for e in engines if s.get(e)}
         fb = self.R.setdefault("primary_fallback", {})
-        for e in self.engines:
+        for e in engines:
             if e in out:
                 fb.pop(e, None)
                 continue
@@ -420,8 +430,19 @@ class Bench:
                 s13.append((t1 - t0) * 1000); s4.append((time.perf_counter() - t1) * 1000)
             out["muvera"] = {"s1_3": float(np.median(s13)), "s4": float(np.median(s4)),
                              "total": float(np.median(np.array(s13) + np.array(s4)))}
-        for e in RAGRT_ENGINES:
+        for e in GRAPH_ENGINES:             # no per-stage events inside a graph: total only
             if e not in P:
+                continue
+            tot = []
+            for q in qids[:WARMUP]:
+                eng.search(e, *self.bank[q], P[e])
+            for q in qids:
+                torch.cuda.synchronize(); t0 = time.perf_counter()
+                eng.search(e, *self.bank[q], P[e]); torch.cuda.synchronize()
+                tot.append((time.perf_counter() - t0) * 1000)
+            out[e] = {"total": float(np.median(tot))}
+        for e in RAGRT_ENGINES:
+            if e not in P or e in GRAPH_ENGINES:
                 continue
             eng.use_engine(e)
             pe = eng.resolve(e, P[e])
@@ -451,9 +472,10 @@ class Bench:
         print(f"  breakdown: {json.dumps(out)}", flush=True)
 
     def stage_filtered(self):
-        P = self.primary()
+        extra = [e for e in (self.args.filtered_extra or []) if e not in self.engines]
+        P = self.primary(self.engines + extra)
         qids = self.test[:self.args.max_filter_queries]
-        filts = [f for f in self.gt_names if f != "all"]
+        filts = [f for f in self.gt_names if f != "all" and (not self.args.filters or f in self.args.filters)]
         out = self.R.setdefault("filtered", {})
         for f in filts:
             out.setdefault(f, {})
@@ -482,7 +504,7 @@ class Bench:
                 out[f"{engine}_sequential_qps"] = timed(
                     lambda batch, e=engine: [self.eng.search(e, Qf, n, P[e]) for Qf, n in batch])
         for e in RAGRT_ENGINES:
-            if e not in P or e in RESID_ENGINES:   # one residual LUT at a time: no batched pipeline
+            if e not in P or e in RESID_ENGINES or e in GRAPH_ENGINES:   # one LUT / one graph at a time
                 continue
             self.eng.use_engine(e)
             pe = self.eng.resolve(e, P[e])
@@ -607,6 +629,12 @@ def main():
     ap.add_argument("--core", type=lambda s: s.split(","), default=None,
                     help="engines that must reach the primary operating point (default plaid,ptms,ragrt), e.g. plaid,ptms,weft")
     ap.add_argument("--muvera_dir", default=None, help="FDE dir from build_muvera_fde.py (engine muvera)")
+    ap.add_argument("--encoder", default="stock", choices=["stock", "fast"],
+                    help="query encoder (stage 0a): ColBERT's own, or fast_encoder.py (fp16 + CUDA graph)")
+    ap.add_argument("--filters", type=lambda s: s.split(","), default=None,
+                    help="filtered stage: only these filters (e.g. corr_near,corr_mid,corr_far)")
+    ap.add_argument("--filtered_extra", type=lambda s: s.split(","), default=None,
+                    help="filtered stage: also run these (e.g. imported) engines at their selected configs, e.g. plaid,ptms")
     args = ap.parse_args()
     if args.baseline_from:
         args.engines = [e for e in args.engines if e not in args.import_engines and e not in ("plaid", "ptms")]

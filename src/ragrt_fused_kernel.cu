@@ -347,8 +347,10 @@ __global__ void sparse_expand_kernel(
     const uint8_t* __restrict__ map_packed_24, int num_passages,
     const uint32_t* __restrict__ doc_predicates, uint32_t query_mask,
     unsigned long long sentinel, unsigned long long* __restrict__ keys,
-    const uint32_t* __restrict__ tok_ids, const uint8_t* __restrict__ residuals, const float* __restrict__ lut
+    const uint32_t* __restrict__ tok_ids, const uint8_t* __restrict__ residuals, const float* __restrict__ lut,
+    const uint32_t* __restrict__ d_mask
 ) {
+    if (d_mask) query_mask = *d_mask;     // static (graph) path: the filter lives in device memory
     int total_tasks = *d_num_tasks;
     if (total_tasks > MAX_TASKS) total_tasks = MAX_TASKS;
     int lane = threadIdx.x % 32;
@@ -388,6 +390,15 @@ __global__ void sparse_expand_kernel(
     }
 }
 
+// Static path: keys [P, cap) become the sentinel, so a sort over all cap keys puts them last.
+__global__ void sparse_fill_sentinel_kernel(const unsigned long long* __restrict__ d_total, long long cap,
+                                            unsigned long long sentinel, unsigned long long* __restrict__ keys) {
+    long long P = (long long)*d_total;
+    if (P > cap) P = cap;
+    for (long long i = P + (long long)blockIdx.x * blockDim.x + threadIdx.x; i < cap; i += (long long)gridDim.x * blockDim.x)
+        keys[i] = sentinel;
+}
+
 __global__ void sparse_tail_values_kernel(
     const unsigned long long* __restrict__ keys, long long n, int num_passages,
     int* __restrict__ pid_out, float* __restrict__ val_out
@@ -425,10 +436,11 @@ struct SumOp {
 // After TileMaxSim: candidates that fail the filter score -inf, so they rank last.
 __global__ void mask_failing_candidates_kernel(
     const int* __restrict__ cand_pids, int n, const uint32_t* __restrict__ doc_predicates,
-    uint32_t query_mask, float* __restrict__ scores
+    uint32_t query_mask, float* __restrict__ scores, const uint32_t* __restrict__ d_mask
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    if (d_mask) { query_mask = *d_mask; if (query_mask == 0) return; }
     int pid = cand_pids[i];
     if (pid < 0 || (doc_predicates[pid] & query_mask) == 0) scores[i] = -INFINITY;
 }
@@ -440,7 +452,18 @@ extern "C" void launch_mask_failing_candidates(
     if (query_mask == 0 || n <= 0) return;
     int threads = 256;
     mask_failing_candidates_kernel<<<(n + threads - 1) / threads, threads, 0, stream>>>(
-        d_cand_pids, n, d_doc_predicates, query_mask, d_scores);
+        d_cand_pids, n, d_doc_predicates, query_mask, d_scores, nullptr);
+}
+
+// Same, with the filter read from device memory (static / CUDA-graph path).
+extern "C" void launch_mask_failing_candidates_dev(
+    const int* d_cand_pids, int n, const uint32_t* d_doc_predicates, const uint32_t* d_mask,
+    float* d_scores, cudaStream_t stream
+) {
+    if (n <= 0) return;
+    int threads = 256;
+    mask_failing_candidates_kernel<<<(n + threads - 1) / threads, threads, 0, stream>>>(
+        d_cand_pids, n, d_doc_predicates, 0u, d_scores, d_mask);
 }
 
 // ---------------------------------------------------------------------------
@@ -836,7 +859,7 @@ extern "C" long long ragrt_stage3_sparse(
         sparse_expand_kernel<<<1024, threads, 0, stream>>>(
             B.num_tasks, B.task_qt, B.task_offset, B.task_length, B.task_base, B.task_start, P,
             d_map_packed_24, num_passages, d_doc_predicates, query_mask, sentinel, B.keys_a,
-            g_tok_ids, g_res, (g_tok_ids && g_res) ? g_res_lut : nullptr);
+            g_tok_ids, g_res, (g_tok_ids && g_res) ? g_res_lut : nullptr, nullptr);
         size_t tb = B.temp_bytes;
         rcub::DeviceRadixSort::SortKeys(B.temp, tb, B.keys_a, B.keys_b, (int)P, 0, end_bit, stream);
         sparse_tail_values_kernel<<<(unsigned)((P + threads - 1) / threads), threads, 0, stream>>>(
@@ -860,6 +883,55 @@ extern "C" long long ragrt_stage3_sparse(
     *d_sums = B.sums;
     *n_valid = U;
     return L;
+}
+
+// Sparse stage 3 with NO host synchronization (for CUDA graphs): sorts a fixed `cap` keys, the
+// P real ones (P = postings counted by Stage 2, on the device) followed by sentinels. The caller
+// must have reserved cap (ragrt_reserve_sparse) and read P beforehand to pick cap >= P + 1;
+// postings beyond cap would be dropped. Produces cap entries (pid, score) in *d_pids / *d_sums:
+// the touched passages, then (-1, -inf) padding. The filter mask is read from d_mask.
+extern "C" long long ragrt_stage3_sparse_static(
+    const uint8_t* d_map_packed_24, int num_passages, const uint32_t* d_doc_predicates,
+    const uint32_t* d_mask, long long cap, int buf_idx, cudaStream_t stream, int** d_pids, float** d_sums
+) {
+    Bufs& B = g_b[buf_idx];
+    if (!B.init || cap > B.sp_cap || cap <= 0) return -1;
+    int pid_bits = 1;
+    while ((1LL << pid_bits) <= (long long)num_passages) ++pid_bits;
+    int end_bit = SP_PID_SHIFT + pid_bits;
+    unsigned long long sentinel = (end_bit >= 64) ? ~0ULL : ((1ULL << end_bit) - 1ULL);
+    int threads = 256;
+    sparse_fill_sentinel_kernel<<<256, threads, 0, stream>>>(B.total_postings, cap, sentinel, B.keys_a);
+    sparse_expand_kernel<<<1024, threads, 0, stream>>>(
+        B.num_tasks, B.task_qt, B.task_offset, B.task_length, B.task_base, B.task_start, cap,
+        d_map_packed_24, num_passages, d_doc_predicates, 0u, sentinel, B.keys_a,
+        g_tok_ids, g_res, (g_tok_ids && g_res) ? g_res_lut : nullptr, d_mask);
+    size_t tb = B.temp_bytes;
+    rcub::DeviceRadixSort::SortKeys(B.temp, tb, B.keys_a, B.keys_b, (int)cap, 0, end_bit, stream);
+    sparse_tail_values_kernel<<<(unsigned)((cap + threads - 1) / threads), threads, 0, stream>>>(
+        B.keys_b, cap, num_passages, B.run_pid_in, B.val_in);
+    tb = B.temp_bytes;
+    rcub::DeviceReduce::ReduceByKey(B.temp, tb, B.run_pid_in, B.run_pid_out, B.val_in, B.sums,
+                                    B.num_runs, SumOp(), (int)cap, stream);
+    sparse_fixup_kernel<<<(unsigned)((cap + threads - 1) / threads), threads, 0, stream>>>(
+        B.num_runs, cap, num_passages, B.run_pid_out, B.sums);
+    *d_pids = B.run_pid_out;
+    *d_sums = B.sums;
+    return cap;
+}
+
+// Allocate the task and sparse buffers up front (outside any graph capture). Returns the
+// capacity actually available (>= cap). Growing it frees the old buffers, so CUDA graphs
+// captured against them must be discarded (the Python side compares sparse_capacity()).
+extern "C" long long ragrt_reserve_sparse(long long cap, int buf_idx, cudaStream_t stream) {
+    ensure_task_bufs(buf_idx);
+    ensure_sparse(buf_idx, cap, stream);
+    return g_b[buf_idx].sp_cap;
+}
+extern "C" long long ragrt_sparse_capacity(int buf_idx) { return g_b[buf_idx].init ? g_b[buf_idx].sp_cap : 0; }
+extern "C" unsigned long long* ragrt_total_postings_ptr(int buf_idx) {
+    ensure_task_bufs(buf_idx);
+    return g_b[buf_idx].total_postings;
 }
 
 extern "C" long long ragrt_last_total_postings(int buf_idx) {

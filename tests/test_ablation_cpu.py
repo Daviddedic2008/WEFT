@@ -102,6 +102,47 @@ def test_compact_prep(seed=3):
     print("  compact prep == full prep gathered at topc")
 
 
+def test_bucket_cap():
+    from graph_search import bucket_cap, mask_to_i32
+    prev = 0
+    for P in [0, 1, 1000, 65535, 65536, 70000, 10**6, 3 * 10**6 + 7]:
+        c = bucket_cap(P, 512)
+        assert c >= P + 1 and c >= 512 and c >= (1 << 16), (P, c)
+        assert c <= max(1 << 16, int((P + 1) * 1.126) + 1), (P, c)      # <= 1/8 octave of padding
+        assert c >= prev; prev = c
+    assert bucket_cap(10, 100000) >= 100000
+    assert mask_to_i32(1 << 31) == -(1 << 31) and mask_to_i32(5) == 5
+    print("  graph capacity buckets: >= P + 1, <= 12.5% padding, monotone")
+
+
+def test_corr_filters():
+    import types
+    if "engines" not in sys.modules:                       # build_corr_filters imports the GPU engines
+        sys.modules["engines"] = types.ModuleType("engines"); sys.modules["engines"].Engines = None
+    import build_corr_filters as B
+    g = torch.Generator().manual_seed(0)
+    Cn = torch.nn.functional.normalize(torch.randn(50, 128, generator=g), dim=-1)
+    doclens = torch.tensor([3, 1, 5, 2])
+    offs = torch.cat([torch.zeros(1, dtype=torch.int64), doclens.cumsum(0)])
+    codes = torch.randint(0, 50, (int(doclens.sum()),), generator=g, dtype=torch.int32)
+    M = B.passage_means(codes, offs, Cn, chunk=3)
+    for i in range(4):
+        ref = torch.nn.functional.normalize(Cn[codes[offs[i]:offs[i + 1]].long()].mean(0), dim=0)
+        assert torch.allclose(M[i], ref, atol=1e-5), i
+    centers = torch.nn.functional.normalize(torch.randn(16, 128, generator=g), dim=-1)
+    q = centers[5] + 0.01 * torch.randn(128, generator=g)
+    r = B.rank_filters(torch.nn.functional.normalize(q, dim=0), centers)
+    assert r["corr_near"] == 5 and r["corr_far"] == int(torch.argmin(centers @ q)) and len(set(r.values())) == 3
+    import tempfile
+    d = tempfile.mkdtemp(); path = os.path.join(d, "predicates.npy")
+    np.save(path, np.array([0b1, 0b10 | (1 << 20), 0xFFFFFFFF], dtype=np.uint32))
+    B.update_predicates(path, np.array([0, 3, 15]), 16)
+    got = np.load(path)
+    assert got.tolist() == [0b1 | (1 << 16), 0b10 | (1 << 19), 0xFFFF | (1 << 31)], [bin(x) for x in got]
+    assert os.path.exists(path + ".bak")
+    print("  correlated filters: passage means, topic ranking, predicate bits 16-31 replaced, low bits kept")
+
+
 def test_muvera_matches_reference():
     cfg, P = M.make_params(dim=24, reps=4, k_sim=3, d_proj=6, seed=2)
     rng = np.random.default_rng(1)
@@ -171,6 +212,8 @@ if __name__ == "__main__":
     test_plain_ivf_tokens(max_len=4)
     test_residual_lut()
     test_compact_prep()
+    test_bucket_cap()
+    test_corr_filters()
     test_muvera_matches_reference()
     test_muvera_tracks_chamfer()
     test_native_prep_and_imputation()

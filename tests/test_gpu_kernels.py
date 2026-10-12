@@ -12,6 +12,8 @@ GPU tests (run on the server after building the extension and the PTX):
 5. Residual scoring on a token-level plain IVF (weft_resid): approximate scores == a torch
    reference of sum_t max over the passage's probed tokens of max(s_tc - m_t + q_t.r, 0);
    compact scores == full scores; LUT off == centroid-only scores.
+6. CUDA-graph path (graph_search.py, engine weft_graph) returns the same results as the eager
+   WEFT path, with and without a filter, across graph re-use and capacity buckets.
 """
 import os, sys
 import numpy as np
@@ -24,6 +26,7 @@ import eval_config as C
 import ragrt_index_lib as L
 from build_plain_ivf import plain_ivf_csr
 from weft_prep import native_prep, residual_lut
+from graph_search import GraphSearch
 
 S = 32
 dev = "cuda"
@@ -394,6 +397,61 @@ def test_residual_scoring(N=2000, NC=40, E=4, seed=5):
     print(f"  residual scoring (token-level IVF, {T:,} postings) == torch reference; compact == full scores")
 
 
+def test_graph_path(N=2500, NC=40, E=4, seed=7):
+    rng = np.random.default_rng(seed)
+    doclens = rng.integers(4, 30, N)
+    T = int(doclens.sum())
+    codes = rng.integers(0, NC, T)
+    pids = np.repeat(np.arange(N), doclens)
+    csr = plain_ivf_csr(codes, pids, NC)
+    lengths = csr["lengths"].astype(np.uint16)
+    t = lambda a: torch.from_numpy(a).to(dev)
+    C128 = torch.nn.functional.normalize(torch.randn(NC, 128), dim=-1).half().to(dev)
+    doc_off = torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(torch.from_numpy(doclens), 0)]).to(dev)
+    pred = rng.integers(0, 4, N).astype(np.int64)               # bits 0 and 1
+    g = torch.Generator(device=dev).manual_seed(seed)
+    idx = X.CorrIndex3D(C.PTX_PATH)
+    idx.build((torch.randn(S, E, 3, device=dev, generator=g) * 0.1).cpu().contiguous(), 0.95, 4)
+    idx.set_geometry(0)
+    idx.bind_index(t(csr["row_ptrs"]), t(csr["col_eids"].astype(L.eid_dtype(E))), t(L.block_sums(lengths)), t(lengths),
+                   t(L.pack_pids_24(csr["pids_sorted"])), doc_off, t(doclens.astype(np.int32)),
+                   t(codes.astype(np.int32)), t(rng.integers(0, 256, (T, 32)).astype(np.uint8)), C128,
+                   torch.tensor([-0.03, -0.01, 0.01, 0.03]).half().to(dev), t(rng.permutation(256).astype(np.uint8)),
+                   t(np.array([[(v >> 6) & 3, (v >> 4) & 3, (v >> 2) & 3, v & 3] for v in range(256)], dtype=np.uint8)),
+                   t(pred).to(torch.uint32), N, NC)
+    idx.set_stage3_sparse(True)
+    gs = GraphSearch(idx, C128, 100, impute=True, reserve=1 << 16)
+    same = overlap = 0
+    try:
+        X.set_codeword_weight(0.0)
+        X.set_compact_scores(True)
+        idx.set_stage1_mode(2)
+        for trial in range(12):
+            ntok = int(rng.integers(3, 33))
+            nc, ndocs = [(4, N), (8, N), (4, 256)][trial % 3]
+            mask = [0, 1, 2, 0][trial % 4]
+            Qf = torch.nn.functional.normalize(torch.randn(32, 128, device=dev, generator=g), dim=-1).half().contiguous()
+            topc, sc, _ = native_prep(Qf[:ntok], C128, nc, impute=True, compact=True)
+            Qs = torch.zeros(ntok, S, 3, device=dev)
+            eager = idx.search_single_query_native(Qf.float(), Qf, Qs, topc, sc, nc, ndocs, 100, mask, E).tolist()
+            ok = lambda x: x >= 0 and (mask == 0 or (pred[x] & mask) != 0)
+            eager = [x for x in eager if ok(x)]
+            graph = [x for x in gs.search(Qf, ntok, nc, ndocs, E, mask) if ok(x)]
+            if ndocs == N:            # every touched passage is reranked: identical results
+                assert graph == eager, (trial, ntok, nc, mask, graph[:5], eager[:5])
+                same += 1
+            else:                     # ties in the approximate score may pick a different top-ndocs
+                o = len(set(graph) & set(eager)) / max(1, len(eager))
+                assert len(graph) == len(eager) and o >= 0.9, (trial, o)
+                overlap += 1
+    finally:
+        X.set_codeword_weight(1.0)
+        X.set_compact_scores(False)
+        idx.set_stage1_mode(0)
+    print(f"  CUDA-graph path == eager WEFT on {same} queries (all candidates reranked), >= 90% overlap on {overlap} "
+          f"(ndocs 256); graphs captured A={gs.stats['captures_a']} B={gs.stats['captures_b']}, replays {gs.stats['replays']}")
+
+
 if __name__ == "__main__":
     for E in (256, 1024, 4096):
         test_stage1(E)
@@ -402,4 +460,5 @@ if __name__ == "__main__":
     test_rerank(bind)
     test_codeword_weight()
     test_residual_scoring()
+    test_graph_path()
     print("ALL GPU KERNEL TESTS PASSED")

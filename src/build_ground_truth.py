@@ -7,6 +7,7 @@ Stored per filter, so filtered runs are judged against the exact filtered answer
   all            no filter
   syn5 ... syn60 synthetic selectivity bits (build_predicates.py)
   own_domain     LoTTE only: each query restricted to its own domain
+  corr_near/mid/far  query-correlated topic filters (build_corr_filters.py), if corr_filters.json exists
 
 Output: <results>/<dataset>/ground_truth.npz with qids [n] and, per filter, pids
 [n, GT_DEPTH] (int32, -1 padded) plus the unfiltered scores [n, GT_DEPTH].
@@ -16,6 +17,7 @@ Cost: one full-corpus TileMaxSim pass per query (about 0.5 s on MS MARCO, 0.15 s
 LoTTE on an RTX 6000 Ada), so run it once per dataset inside tmux.
 
 Usage: python3 build_ground_truth.py --dataset msmarco [--limit N]
+       python3 build_ground_truth.py --dataset lotte --merge    # only filters the file lacks
 """
 import os, sys, json, time, argparse
 import numpy as np
@@ -35,7 +37,16 @@ def filter_masks(ds, qids, meta):
         masks["syn" + lbl.rstrip("%")] = bit
     if ds["has_domains"]:
         masks["own_domain"] = lambda q: 1 << (C.DOMAIN_BIT_BASE + C.LOTTE_DOMAINS.index(meta[q]["domain"]))
+    corr = load_corr_filters(ds)
+    for name, table in corr.items():
+        masks[name] = lambda q, t=table: t[q]
     return masks
+
+
+def load_corr_filters(ds):
+    """{filter name: {qid: mask}} from build_corr_filters.py, or {}."""
+    p = os.path.join(ds["results_dir"], "corr_filters.json")
+    return json.load(open(p))["filters"] if os.path.exists(p) else {}
 
 
 def main():
@@ -43,6 +54,8 @@ def main():
     ap.add_argument("--dataset", required=True, choices=list(C.DATASETS))
     ap.add_argument("--limit", type=int, default=None, help="only the first N queries (smoke test)")
     ap.add_argument("--save_every", type=int, default=250)
+    ap.add_argument("--merge", action="store_true",
+                    help="keep an existing ground truth file and only add the filters it lacks")
     args = ap.parse_args()
 
     ds = C.dataset(args.dataset)
@@ -67,8 +80,18 @@ def main():
             pass_cache[m] = (eng.pred_gpu & m) != 0
         return pass_cache[m]
 
+    old = {}
+    if args.merge and os.path.exists(out_path):
+        z = np.load(out_path)
+        assert [str(q) for q in z["qids"]] == qids, "existing ground truth is for a different query set"
+        old = {k: z[k] for k in z.files if k not in ("qids", "done")}
+        masks = {n: m for n, m in masks.items() if n not in old}
+        if not masks:
+            print(f"{out_path} already has every filter"); return
+        print(f"Merging new filters {sorted(masks)} into {out_path}")
+        part_path = out_path + ".merge.partial.npz"
     res = {name: np.full((len(qids), K), -1, dtype=np.int32) for name in masks}
-    top_scores = np.full((len(qids), K), np.nan, dtype=np.float32)
+    top_scores = old["scores_all"] if old else np.full((len(qids), K), np.nan, dtype=np.float32)
     done = 0
     if os.path.exists(part_path):
         z = np.load(part_path, allow_pickle=False)
@@ -84,7 +107,8 @@ def main():
     t0 = time.time()
 
     def save(path, n_done):
-        np.savez(path, qids=np.array(qids), done=n_done, scores_all=top_scores, **res)
+        keep = {k: v for k, v in old.items() if k != "scores_all"}
+        np.savez(path, qids=np.array(qids), done=n_done, scores_all=top_scores, **keep, **res)
 
     for i in range(done, len(qids)):
         Qf, _ = eng.encode(questions[i][1])

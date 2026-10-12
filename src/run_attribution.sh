@@ -8,6 +8,11 @@
 #   weft        WEFT (plain IVF + native fp16 prep + imputation) and its no-imputation ablation -> BASE_weft
 #   resid       residual-correction ablation: build the token-level plain IVF (once; ~1.4x the
 #               postings + 4 B/posting token ids) and run weft_tok, weft_resid, weft_resid_norr -> BASE_resid
+#   corr        query-correlated topic filters (build_corr_filters.py; rewrites predicates.npy of the
+#               index dirs, keeping .bak) + their exact ground truth (build_ground_truth.py --merge)
+#   graph       weft (eager, re-run) vs weft_graph (CUDA graphs, one sync) on the plain IVF, with the
+#               filtered stage on every filter incl. corr_* for plaid and ptms too -> BASE_graph
+#   encode      stage 0a: stock ColBERT query encoder vs fast_encoder.py (bench_encode.py)
 #   muvera      build MUVERA FDEs (once; needs export_embeddings.py output) and run muvera -> BASE_muvera
 # Disk: plain IVF ~ 3 B x (deduplicated postings), MUVERA 2560 dims ~ 12.4 GB on LoTTE.
 set -euo pipefail
@@ -57,6 +62,21 @@ for st in $STEPS; do
           --core plaid,ptms,weft \
           --engines weft_tok,weft_resid,weft_resid_norr --stages sweep,select,test,breakdown,throughput,attribution,filtered,drops
       python3 plot_results.py --dataset "$DATASET" --results_subdir "${BASE}_resid" ;;
+    corr)
+      DIRS=""; for d in "$CSR" "$IVF_DIR" "$TOK_DIR"; do [ -f "$d/predicates.npy" ] && DIRS="$DIRS $d"; done
+      python3 build_corr_filters.py --dataset "$DATASET" --update_dirs $DIRS
+      python3 build_ground_truth.py --dataset "$DATASET" --merge ;;
+    graph)
+      [ -f "$IVF_DIR/csr_packed_24.npy" ] || { echo "run the ivf step first"; exit 1; }
+      PREV="$ROOT/${BASE}_resid"; [ -f "$PREV/results.json" ] || PREV="$ROOT/${BASE}_weft"
+      python3 run_benchmarks.py --dataset "$DATASET" --results_subdir "${BASE}_graph" --sparse_csr_dir "$IVF_DIR" \
+          --baseline_from "$PREV" \
+          --import_engines plaid,ptms,ragrt,ragrt_bf,ragrt_nofilter,ragrt_centroid,ragrt_ivf,weft_noimpute,weft_tok,weft_resid,weft_resid_norr \
+          --core plaid,ptms,weft --filtered_extra plaid,ptms \
+          --engines weft,weft_graph --stages sweep,select,test,breakdown,throughput,attribution,filtered
+      python3 plot_results.py --dataset "$DATASET" --results_subdir "${BASE}_graph" ;;
+    encode)
+      python3 bench_encode.py --dataset "$DATASET" --sparse_csr_dir "$IVF_DIR" ;;
     muvera)
       [ -f "$EMB_DIR/doc_embs_fp16.npy" ] || { echo "run export_embeddings.py --dataset $DATASET --outdir $EMB_DIR first"; exit 1; }
       [ -f "$MUV_DIR/fde_docs_fp16.npy" ] || python3 build_muvera_fde.py --emb_dir "$EMB_DIR" --outdir "$MUV_DIR" \

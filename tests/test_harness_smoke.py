@@ -33,7 +33,7 @@ DOCS = torch.tensor(RNG.normal(size=(N_DOCS, DIM)), dtype=torch.float32)
 
 FAKE_RESID = ("weft_resid", "weft_resid_norr")
 FAKE_RAGRT = ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft", "weft_noimpute",
-              "weft_tok") + FAKE_RESID
+              "weft_tok", "weft_graph") + FAKE_RESID
 
 
 def cfg_key(engine, p):
@@ -126,6 +126,7 @@ class FakeEngines:
 eng_mod = types.ModuleType("engines")
 eng_mod.Engines, eng_mod.cfg_key, eng_mod.RAGRT_ENGINES = FakeEngines, cfg_key, FAKE_RAGRT
 eng_mod.RESID_ENGINES = FAKE_RESID
+eng_mod.GRAPH_ENGINES = ("weft_graph",)
 sys.modules["engines"] = eng_mod
 
 import eval_config as C
@@ -238,7 +239,7 @@ def main():
                 "--baseline_from", os.path.join(src, "ivf"),
                 "--import_engines", "plaid,ptms,ragrt,ragrt_bf,ragrt_nofilter,ragrt_centroid,ragrt_ivf,weft,weft_noimpute",
                 "--core", "plaid,ptms,weft",
-                "--engines", "weft_tok,weft_resid,weft_resid_norr", "--stages", "sweep,select,test,breakdown,throughput",
+                "--engines", "weft_tok,weft_resid,weft_resid_norr,weft_graph", "--stages", "sweep,select,test,breakdown,throughput",
                 "--repeats", "1", "--max_filter_queries", "40", "--throughput_queries", "32", "--targets", "0.5,0.9"]
     run_benchmarks.main()
     R4 = json.load(open(os.path.join(src, "resid", "results.json")))
@@ -247,10 +248,32 @@ def main():
     steps = {(a["slow"], a["fast"]) for c in R4["comparisons"].values() for a in c.get("attribution", [])}
     assert {("weft", "weft_tok"), ("weft_tok", "weft_resid"), ("weft_resid", "weft_resid_norr")} <= steps, steps
     assert R4["breakdown"]["weft_resid_norr"]["s4_tms"] == 0.0
+    assert set(R4["breakdown"]["weft_graph"]) == {"total"} and "weft_graph_pipelined_qps" not in R4["throughput"]
     tp = R4["throughput"]
     assert "weft_tok_pipelined_qps" in tp and not any(k.startswith("weft_resid") and "pipelined" in k for k in tp), tp.keys()
     sys.argv = ["plot_results.py", "--dataset", "msmarco", "--results_subdir", "resid"]
     plot_results.main()
+
+    # query-correlated filters: per-query masks, merged into the ground truth, then the filtered
+    # stage for a new engine plus imported baselines (--filtered_extra), restricted with --filters
+    gt_path = C.dataset("msmarco")["gt_path"]
+    qids_gt = [str(q) for q in np.load(gt_path)["qids"]]
+    corr = {"corr_near": {q: 1 << 0 for q in qids_gt}, "corr_far": {q: 1 << (1 + int(q) % 2) for q in qids_gt}}
+    json.dump({"k": 2, "bit_base": 0, "filters": corr}, open(os.path.join(src, "corr_filters.json"), "w"))
+    before = np.load(gt_path)["syn5"].copy()
+    sys.argv = ["build_ground_truth.py", "--dataset", "msmarco", "--merge"]
+    build_ground_truth.main()
+    gt2 = np.load(gt_path)
+    assert {"corr_near", "corr_far", "syn5", "all"} <= set(gt2.files) and np.array_equal(gt2["syn5"], before)
+    assert np.array_equal(gt2["corr_near"], gt2["syn5"]), "same mask, same exact answer"
+    for i, q in enumerate(qids_gt[:20]):
+        assert all(pred[p] & corr["corr_far"][q] for p in gt2["corr_far"][i] if p >= 0)
+    sys.argv = ["run_benchmarks.py", "--dataset", "msmarco", "--quick", "--tune_size", "60", "--results_subdir", "resid",
+                "--engines", "weft_graph", "--filtered_extra", "plaid,ptms", "--filters", "corr_near,corr_far",
+                "--stages", "filtered", "--repeats", "1", "--max_filter_queries", "40", "--targets", "0.5,0.9"]
+    run_benchmarks.main()
+    R5 = json.load(open(os.path.join(src, "resid", "results.json")))
+    assert {"plaid", "ptms", "weft_graph"} <= set(R5["filtered"]["corr_far"]) and "corr_mid" not in R5["filtered"]
 
     sys.argv = ["plot_results.py", "--dataset", "msmarco"]
     plot_results.main()

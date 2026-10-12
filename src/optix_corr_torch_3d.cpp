@@ -62,6 +62,14 @@ extern "C" long long ragrt_stage3_sparse(const uint8_t* d_map_packed_24, int num
                                          int buf_idx, cudaStream_t stream, int** d_pids, float** d_sums,
                                          long long* n_valid);
 extern "C" long long ragrt_last_total_postings(int buf_idx);
+extern "C" long long ragrt_stage3_sparse_static(const uint8_t* d_map_packed_24, int num_passages, const uint32_t* d_doc_predicates,
+                                                const uint32_t* d_mask, long long cap, int buf_idx, cudaStream_t stream,
+                                                int** d_pids, float** d_sums);
+extern "C" long long ragrt_reserve_sparse(long long cap, int buf_idx, cudaStream_t stream);
+extern "C" long long ragrt_sparse_capacity(int buf_idx);
+extern "C" unsigned long long* ragrt_total_postings_ptr(int buf_idx);
+extern "C" void launch_mask_failing_candidates_dev(const int* d_cand_pids, int n, const uint32_t* d_doc_predicates,
+                                                   const uint32_t* d_mask, float* d_scores, cudaStream_t stream);
 extern "C" void ragrt_set_drop_stats(int enabled);
 extern "C" void ragrt_reset_drop_stats();
 extern "C" void ragrt_drop_stats(unsigned long long* out);
@@ -753,6 +761,76 @@ public:
         return {d_candidate_pids[0].slice(0, 0, k_candidates).clone(), d_cand_approx[0].slice(0, 0, k_candidates).clone()};
     }
 
+    // ------------------------------------------------------------------ static (CUDA graph) path
+    // A query = phase A (Stage 1 + Stage 2) -> host reads the posting count P (one sync) ->
+    // phase B (sync-free sparse Stage 3 over a fixed capacity, top-k, rerank, filter, top-k).
+    // Neither phase synchronizes or allocates driver memory, so Python can capture each one in a
+    // CUDA graph (engines.GraphSearch). Call reserve_static() first, outside any capture.
+    long long reserve_static(long long cap, int k_candidates) {
+        TORCH_CHECK(is_bound, "bind_index first");
+        cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+        ensure_cand_capacity(k_candidates);
+        return ragrt_reserve_sparse(cap, 0, stream);
+    }
+    long long sparse_capacity() { return ragrt_sparse_capacity(0); }
+    torch::Tensor total_postings_tensor() {
+        TORCH_CHECK(is_bound, "bind_index first");
+        return torch::from_blob((void*)ragrt_total_postings_ptr(0), {1},
+                                torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
+    }
+
+    void static_phase_a(torch::Tensor Q_sub3d, torch::Tensor topc, torch::Tensor scores, int k_cent, int k_eids) {
+        TORCH_CHECK(stage1_mode != 0, "the static path needs a CUDA-core Stage 1 (modes 1, 2)");
+        TORCH_CHECK(stage3_sparse, "the static path needs the sparse Stage 3");
+        TORCH_CHECK(!ragrt_residual_scoring_on(), "the static path does not support residual scoring");
+        TORCH_CHECK(is_bound && E > 0, "bind_index and build first");
+        TORCH_CHECK(Q_sub3d.dim() == 3 && Q_sub3d.size(1) == NUM_3D_SUBSPACES && Q_sub3d.size(0) <= 32, "Q_sub3d [ntok<=32, 32, 3]");
+        TORCH_CHECK(k_eids >= 1 && k_eids <= 256, "k_eids must be in [1, 256]");
+        cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+        int nq = (int)Q_sub3d.size(0);
+        int total_rays = nq * NUM_3D_SUBSPACES;
+        const float* qp = Q_sub3d.data_ptr<float>();
+        TORCH_CHECK(Q_sub3d.is_contiguous() && Q_sub3d.scalar_type() == torch::kFloat32, "Q_sub3d contiguous float32");
+        int level = level_or_zero(k_eids);
+        CorrParams3D p; fill_params(p, qp, 0, level, k_eids);
+        run_stage1(p, (CUdeviceptr)d_p_single, qp, total_rays, k_eids, level, stream);
+        ragrt_stage2(buf_out_c[0].data_ptr<int>(), buf_out_v[0].data_ptr<float>(), buf_out_n[0].data_ptr<int>(),
+                     topc.data_ptr<int>(), scores.data_ptr<float>(), total_rays, max_hits(), k_eids, k_cent, nq,
+                     b_num_centroids, b_csr_row_ptrs.data_ptr<int64_t>(), b_csr_col_eids.data_ptr(), b_eid_bytes,
+                     b_csr_block_sums.data_ptr<int64_t>(), (const uint16_t*)b_csr_lengths.data_ptr(),
+                     hits_are_prims() ? d_prim_eid : nullptr, E, 0, stream);
+    }
+
+    // Returns the top k_top pids (-1 = padding). mask_dev: one int32 on the GPU holding the filter bits.
+    torch::Tensor static_phase_b(torch::Tensor Q_full_fp16, long long cap, int k_candidates, int k_top, torch::Tensor mask_dev) {
+        TORCH_CHECK(k_candidates >= 1 && k_candidates <= cap && k_candidates <= max_allocated_cands, "bad k_candidates");
+        TORCH_CHECK(mask_dev.is_cuda() && mask_dev.numel() == 1 && mask_dev.element_size() == 4, "mask_dev: one 32-bit int on the GPU");
+        cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+        int* d_pids = nullptr; float* d_sums = nullptr;
+        long long L = ragrt_stage3_sparse_static(b_map_packed.data_ptr<uint8_t>(), (int)b_num_passages,
+                                                 (const uint32_t*)b_doc_predicates.data_ptr(), (const uint32_t*)mask_dev.data_ptr(),
+                                                 cap, 0, stream, &d_pids, &d_sums);
+        TORCH_CHECK(L == cap, "sparse capacity ", sparse_capacity(), " < cap ", cap, ": call reserve_static first");
+        auto of = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+        auto oi = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+        auto sums = torch::from_blob(d_sums, {L}, of);
+        auto pids = torch::from_blob(d_pids, {L}, oi);
+        auto top = torch::topk(sums, k_candidates);
+        auto cand = d_candidate_pids[0].slice(0, 0, k_candidates);
+        cand.copy_(pids.index({std::get<1>(top)}));
+        d_cand_approx[0].slice(0, 0, k_candidates).copy_(std::get<0>(top));
+        launch_tile_maxsim_fused_decomp(
+            Q_full_fp16.data_ptr(), d_candidate_pids[0].data_ptr<int>(), b_doc_offsets.data_ptr<int64_t>(),
+            b_doc_lens.data_ptr<int>(), k_candidates, b_codes.data_ptr<int>(), b_residuals.data_ptr<uint8_t>(),
+            b_centroids_128.data_ptr(), b_bucket_weights.data_ptr(), b_reversed_bit_map.data_ptr<uint8_t>(),
+            b_decomp_table.data_ptr<uint8_t>(), d_final_scores[0].data_ptr<float>(), stream);
+        launch_mask_failing_candidates_dev(d_candidate_pids[0].data_ptr<int>(), k_candidates,
+            (const uint32_t*)b_doc_predicates.data_ptr(), (const uint32_t*)mask_dev.data_ptr(),
+            d_final_scores[0].data_ptr<float>(), stream);
+        auto fin = torch::topk(d_final_scores[0].slice(0, 0, k_candidates), std::min(k_top, k_candidates));
+        return cand.index({std::get<1>(fin)});
+    }
+
     pybind11::dict info() {
         pybind11::dict d;
         d["num_entries"] = E;
@@ -842,6 +920,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("search_single_query_native", &CorrIndex3D::search_single_query_native,
              pybind11::arg("Q_full_128_fp32"), pybind11::arg("Q_full_fp16"), pybind11::arg("Q_sub3d"), pybind11::arg("topc"), pybind11::arg("scores"),
              pybind11::arg("k_cent"), pybind11::arg("k_candidates"), pybind11::arg("k_top"), pybind11::arg("query_mask") = 0, pybind11::arg("k_eids") = 16)
+        .def("reserve_static", &CorrIndex3D::reserve_static, pybind11::arg("cap"), pybind11::arg("k_candidates"),
+             "allocate task/sparse buffers for the static (CUDA graph) path; returns the sparse capacity")
+        .def("sparse_capacity", &CorrIndex3D::sparse_capacity)
+        .def("total_postings_tensor", &CorrIndex3D::total_postings_tensor,
+             "int64 [1] view of the posting count written by Stage 2 (read with .item() between the phases)")
+        .def("static_phase_a", &CorrIndex3D::static_phase_a, pybind11::arg("Q_sub3d"), pybind11::arg("topc"),
+             pybind11::arg("scores"), pybind11::arg("k_cent"), pybind11::arg("k_eids"))
+        .def("static_phase_b", &CorrIndex3D::static_phase_b, pybind11::arg("Q_full_fp16"), pybind11::arg("cap"),
+             pybind11::arg("k_candidates"), pybind11::arg("k_top"), pybind11::arg("mask_dev"))
         .def("search_batch_pipelined", &CorrIndex3D::search_batch_pipelined,
              pybind11::arg("Q_full_128_list"), pybind11::arg("Q_full_fp16_list"), pybind11::arg("Q_sub3d_list"), pybind11::arg("topc_list"), pybind11::arg("scores_list"),
              pybind11::arg("k_cent"), pybind11::arg("k_candidates"), pybind11::arg("k_top"), pybind11::arg("query_mask") = 0, pybind11::arg("k_eids") = 16);
