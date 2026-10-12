@@ -68,7 +68,8 @@ for st in $STEPS; do
       python3 build_ground_truth.py --dataset "$DATASET" --merge ;;
     graph)
       [ -f "$IVF_DIR/csr_packed_24.npy" ] || { echo "run the ivf step first"; exit 1; }
-      PREV="$ROOT/${BASE}_resid"; [ -f "$PREV/results.json" ] || PREV="$ROOT/${BASE}_weft"
+      PREV="$ROOT/$BASE"   # newest earlier run that has weft's sweep: BASE_resid, BASE_weft, or BASE itself
+      for c in "$ROOT/${BASE}_weft" "$ROOT/${BASE}_resid"; do [ -f "$c/results.json" ] && PREV="$c"; done
       python3 run_benchmarks.py --dataset "$DATASET" --results_subdir "${BASE}_graph" --sparse_csr_dir "$IVF_DIR" \
           --baseline_from "$PREV" \
           --import_engines plaid,ptms,ragrt,ragrt_bf,ragrt_nofilter,ragrt_centroid,ragrt_ivf,weft_noimpute,weft_tok,weft_resid,weft_resid_norr \

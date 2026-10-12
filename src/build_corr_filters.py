@@ -34,20 +34,20 @@ FILTERS = ("corr_near", "corr_mid", "corr_far")
 
 
 @torch.no_grad()
-def passage_means(codes, doc_offsets, centroids, chunk=500_000):
-    """codes int32 [T] (cuda), doc_offsets int64 [N + 1] (cuda), centroids [nc, 128] -> unit means [N, 128] f32."""
+def passage_means(codes, doc_offsets, centroids, chunk=2_000_000):
+    """codes int32 [T] (cuda), doc_offsets int64 [N + 1] (cuda), centroids [nc, 128] -> unit means [N, 128] f32.
+    Chunked over tokens (2M tokens x 128 x 4 B = 1 GB of gathered centroids per chunk)."""
     N = doc_offsets.numel() - 1
-    out = torch.empty(N, centroids.shape[1], dtype=torch.float32, device=codes.device)
+    T = int(doc_offsets[-1])
     Cf = centroids.float()
-    for a in range(0, N, chunk):
-        b = min(N, a + chunk)
-        t0, t1 = int(doc_offsets[a]), int(doc_offsets[b])
-        lens = (doc_offsets[a + 1:b + 1] - doc_offsets[a:b])
-        local = torch.repeat_interleave(torch.arange(b - a, device=codes.device), lens)
-        s = torch.zeros(b - a, Cf.shape[1], dtype=torch.float32, device=codes.device)
-        s.index_add_(0, local, Cf[codes[t0:t1].long()])
-        out[a:b] = torch.nn.functional.normalize(s, dim=-1)
-    return out
+    out = torch.zeros(N, Cf.shape[1], dtype=torch.float32, device=codes.device)
+    ends = doc_offsets[1:].contiguous()
+    for t0 in range(0, T, chunk):
+        t1 = min(T, t0 + chunk)
+        tok = torch.arange(t0, t1, device=codes.device, dtype=torch.int64)
+        pid = torch.searchsorted(ends, tok, right=True)          # passage of each token
+        out.index_add_(0, pid, Cf[codes[t0:t1].long()])
+    return torch.nn.functional.normalize(out, dim=-1)
 
 
 def rank_filters(qvec, centers):

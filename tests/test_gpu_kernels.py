@@ -347,6 +347,9 @@ def test_residual_scoring(N=2000, NC=40, E=4, seed=5):
             rank[topc[qt].long()] = torch.arange(topc.shape[1], device=dev)
             r = rank[tok_code]
             hit = r >= 0
+            # Stage 2 drops a list whose (shifted) centroid score is <= 0, i.e. a probed centroid that
+            # ties the imputation floor m in fp16; mirror that (with residuals it is not a no-op)
+            hit &= sc[qt].clamp_min(-1)[r.clamp_min(0)] > 0
             v = sc[qt][r[hit]].double()
             if lut is not None:
                 v = v + lut[qt][torch.arange(32, device=dev)[None, :], res_bytes[hit]].sum(1).double()
