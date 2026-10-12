@@ -26,6 +26,8 @@ ragrt_centroid (no codeword score term), ragrt_ivf (plain IVF on the RAGRT kerne
 build_plain_ivf.py index via --sparse_csr_dir), muvera (--muvera_dir). The "attribution"
 block of each comparison lists latency ratios and paired quality differences for the
 ablation chain ptms -> ragrt_ivf -> ragrt_nofilter / ragrt_centroid -> ragrt_bf -> ragrt.
+Residual-correction ablation (weft_tok, weft_resid, weft_resid_norr): needs a token-level index
+(build_plain_ivf.py --tokens) via --sparse_csr_dir; run_attribution.sh step "resid".
 
 RAGRT options (see engines.py): --geometry polar|fan, --stage3 sparse|dense,
 --rerank wmma|simt (also used by ptms), --rt_quantile, --sparse_csr_dir (another
@@ -45,12 +47,13 @@ import torch
 
 import eval_config as C
 import eval_lib as E
-from engines import Engines, cfg_key, RAGRT_ENGINES
+from engines import Engines, cfg_key, RAGRT_ENGINES, RESID_ENGINES
 import rtrag_corr_3d
 
 CORE = ["plaid", "ptms", "ragrt"]          # the primary operating point must be reachable by these
 # ablations: no-RT Stage 1; codebook filter off; no codeword score; plain IVF on RAGRT kernels; MUVERA
-ENGINES = CORE + ["ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft_noimpute", "weft", "muvera"]
+ENGINES = CORE + ["ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft_noimpute", "weft",
+                  "weft_tok", "weft_resid", "weft_resid_norr", "muvera"]
 # (slow, fast, what the step from slow to fast changes); ratio = latency(slow) / latency(fast)
 ATTRIBUTION = [
     ("ptms", "ragrt_ivf", "engine: PLAID candidate generation -> same algorithm on RAGRT kernels"),
@@ -65,6 +68,11 @@ ATTRIBUTION = [
     ("ptms", "weft", "WEFT vs PLAID+TMS"),
     ("ragrt", "weft", "WEFT vs the original RT design"),
     ("muvera", "ragrt_bf", "RAGRT (no RT) vs MUVERA"),
+    ("weft", "weft_tok", "token-level postings (no per-passage dedup)"),
+    ("weft_tok", "weft_resid", "residual correction (WARP implicit decompression) + rerank"),
+    ("weft", "weft_resid", "residual correction overall (index + scoring)"),
+    ("weft_resid", "weft_resid_norr", "drop the exact rerank"),
+    ("weft", "weft_resid_norr", "WEFT vs a WARP-style GPU pipeline (no rerank)"),
 ]
 DEFAULT_ENGINES = CORE + ["ragrt_bf"]
 PLAID_DEFAULT_K100 = {"ncells": 2, "threshold": 0.45, "ndocs": 1024}   # ColBERT Searcher defaults for k=100
@@ -80,6 +88,9 @@ NOFILTER_GRID = [{"nc": n, "eids": "all", "ndocs": d}
                  for n in [1, 2, 4, 8, 16, 32, 64]
                  for d in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]]
 QUICK_RAGRT = [{"nc": 32, "eids": 16, "ndocs": 4096}, {"nc": 16, "eids": 32, "ndocs": 16384}]
+# no rerank: ndocs only sets how many candidates leave Stage 3; the top-k by approximate score
+# is the same for any ndocs >= k, so one value per nc
+NORR_GRID = [{"nc": n, "eids": "all", "ndocs": C.TOP_K} for n in [1, 2, 4, 8, 16, 32, 64, 128]]
 MUVERA_GRID = [{"cands": c} for c in [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]]
 ATTRIB_QUERIES = 200
 BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
@@ -236,7 +247,8 @@ class Bench:
         nof = NOFILTER_GRID[:2] if self.args.quick else NOFILTER_GRID
         grids = {"plaid": plaid_grid, "ptms": plaid_grid, "ragrt": ragrt_grid, "ragrt_bf": ragrt_grid,
                  "ragrt_nofilter": nof, "ragrt_centroid": ragrt_grid, "ragrt_ivf": nof,
-                 "weft": nof, "weft_noimpute": nof,
+                 "weft": nof, "weft_noimpute": nof, "weft_tok": nof, "weft_resid": nof,
+                 "weft_resid_norr": NORR_GRID[:2] if self.args.quick else NORR_GRID,
                  "muvera": MUVERA_GRID[:2] if self.args.quick else MUVERA_GRID}
         if PLAID_DEFAULT_K100 not in grids["plaid"]:
             grids["plaid"] = grids["plaid"] + [PLAID_DEFAULT_K100]
@@ -426,6 +438,13 @@ class Bench:
                 eng.use_engine("ragrt")
             st = np.array(st)
             names = ["s0b_prep", "s1_rt", "s2_gather", "s3_score", "s4_tms"]
+            if e == "weft_resid_norr":      # the profiled path always reranks; this engine does not:
+                st[:, 4] = 0.0              # drop s4 and time the real (no-rerank) search for the total
+                tot = []
+                for q in qids:
+                    torch.cuda.synchronize(); t0 = time.perf_counter()
+                    eng.search(e, *self.bank[q], P[e]); torch.cuda.synchronize()
+                    tot.append((time.perf_counter() - t0) * 1000)
             out[e] = {n: float(np.median(st[:, i])) for i, n in enumerate(names)}
             out[e]["total"] = float(np.median(tot))
             out[e]["gpu_sum"] = float(np.median(st.sum(axis=1)))
@@ -463,7 +482,7 @@ class Bench:
                 out[f"{engine}_sequential_qps"] = timed(
                     lambda batch, e=engine: [self.eng.search(e, Qf, n, P[e]) for Qf, n in batch])
         for e in RAGRT_ENGINES:
-            if e not in P:
+            if e not in P or e in RESID_ENGINES:   # one residual LUT at a time: no batched pipeline
                 continue
             self.eng.use_engine(e)
             pe = self.eng.resolve(e, P[e])

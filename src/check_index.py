@@ -70,6 +70,20 @@ def check(d):
         hi_count += int(np.count_nonzero(pids >= (1 << 22)))
     expect(max_pid == num_passages - 1, f"max pid {max_pid:,} == num_passages - 1")
     print(f"  postings with pid >= 2^22 (old bug range): {hi_count:,} ({hi_count / n_post:.1%})")
+    tp = os.path.join(d, "csr_token_ids.npy")
+    if os.path.exists(tp):          # token-level plain IVF (residual ablation)
+        tids = np.load(tp, mmap_mode="r")
+        expect(len(tids) == n_post and tids.dtype == np.uint32, f"one uint32 token id per posting ({len(tids):,})")
+        mono, tmax = True, 0
+        for a in range(0, n_post, CHUNK_POSTINGS):
+            t = np.asarray(tids[a:a + CHUNK_POSTINGS]).astype(np.int64)
+            tmax = max(tmax, int(t.max()))
+            # tokens are numbered in passage order, so pid must be non-decreasing in token id
+            p = L.unpack_pids_24(packed[3 * a: 3 * min(a + CHUNK_POSTINGS, n_post)])
+            o = np.argsort(t, kind="stable")
+            mono &= bool(np.all(np.diff(p[o]) >= 0))
+        expect(mono, "pid is non-decreasing in token id (token ids match pids)")
+        expect(tmax + 1 == n_post, f"token ids cover 0..{n_post - 1:,} (max {tmax:,})")
     return ok
 
 

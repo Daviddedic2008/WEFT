@@ -75,6 +75,10 @@ extern "C" void ragrt_set_rerank_mode(int mode);
 extern "C" int  ragrt_get_rerank_mode();
 extern "C" void ragrt_set_codeword_weight(float w);
 extern "C" float ragrt_get_codeword_weight();
+extern "C" void ragrt_set_compact_scores(int on);
+extern "C" int ragrt_get_compact_scores();
+extern "C" void ragrt_set_residual_scoring(const uint32_t* tok_ids, const uint8_t* residuals, const float* lut);
+extern "C" int ragrt_residual_scoring_on();
 
 static const char* DROP_STAT_NAMES[] = {
     "launches", "rays", "rays_overflow", "hits_lost_to_cap", "combos", "combos_found",
@@ -134,6 +138,7 @@ public:
     torch::Tensor b_csr_row_ptrs, b_csr_col_eids, b_csr_block_sums, b_csr_lengths, b_map_packed;
     torch::Tensor b_doc_offsets, b_doc_lens, b_codes, b_residuals;
     torch::Tensor b_centroids_128, b_bucket_weights, b_reversed_bit_map, b_decomp_table;
+    torch::Tensor b_token_ids, b_res_lut;   // token-level plain-IVF index + per-query residual LUT
     torch::Tensor b_doc_predicates;
     int64_t b_num_passages = 0;
     int b_num_centroids = 0;
@@ -470,6 +475,28 @@ public:
         is_bound = true;
     }
 
+    // Token-level plain-IVF index: global token id of every posting (same order as csr_packed_24).
+    void bind_token_ids(torch::Tensor token_ids) {
+        TORCH_CHECK(is_bound, "bind_index first");
+        TORCH_CHECK(token_ids.numel() * 3 == b_map_packed.numel(), "one token id per posting");
+        b_token_ids = token_ids.to(torch::kInt32).contiguous();
+    }
+
+    // Per-query residual LUT [ntok, 32, 256] (float32, on the GPU); an empty tensor turns residual
+    // scoring off. Used by the next search; not valid for search_batch_pipelined (one LUT per query).
+    void set_residual_lut(torch::Tensor lut) {
+        if (lut.numel() == 0) {
+            b_res_lut = torch::Tensor();
+            ragrt_set_residual_scoring(nullptr, nullptr, nullptr);
+            return;
+        }
+        TORCH_CHECK(b_token_ids.defined(), "residual scoring needs bind_token_ids (token-level plain-IVF index)");
+        TORCH_CHECK(lut.dim() == 3 && lut.size(1) == 32 && lut.size(2) == 256 && lut.size(0) <= 32, "lut must be [ntok<=32, 32, 256]");
+        b_res_lut = lut.to(torch::kFloat32).contiguous();
+        ragrt_set_residual_scoring((const uint32_t*)b_token_ids.data_ptr<int>(), b_residuals.data_ptr<uint8_t>(),
+                                   b_res_lut.data_ptr<float>());
+    }
+
     // ------------------------------------------------------------------ stages
     void fill_params(CorrParams3D& p, const float* qp, int buf, int level, int k_eids) {
         p = {};
@@ -735,6 +762,9 @@ public:
         d["rerank"] = ragrt_get_rerank_mode() == 1 ? "wmma" : "simt";
         d["eid_bytes"] = b_eid_bytes;
         d["codeword_weight"] = ragrt_get_codeword_weight();
+        d["compact_scores"] = ragrt_get_compact_scores();
+        d["residual_scoring"] = ragrt_residual_scoring_on();
+        d["token_level_index"] = b_token_ids.defined();
         pybind11::list lv;
         for (size_t l = 0; l < level_k.size(); ++l) {
             pybind11::dict x;
@@ -793,6 +823,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              "Exact-threshold scenes: taus [L, 32] on unit-query . codeword, ks[l] = k_eids level l serves")
         .def("level_for", &CorrIndex3D::level_for)
         .def("bind_index", &CorrIndex3D::bind_index)
+        .def("bind_token_ids", &CorrIndex3D::bind_token_ids, pybind11::arg("token_ids"),
+             "token-level plain-IVF index: global token id per posting (enables residual scoring)")
+        .def("set_residual_lut", &CorrIndex3D::set_residual_lut, pybind11::arg("lut"),
+             "per-query residual LUT [ntok, 32, 256] float32 (empty tensor = residual scoring off)")
         .def("set_geometry", &CorrIndex3D::set_geometry, pybind11::arg("geometry"), "0 = fan (legacy), 1 = polar (exact threshold, any-hit), 2 = polar_iter (k nearest-hit traversals, no hit shaders)")
         .def("set_stage1_mode", &CorrIndex3D::set_stage1_mode, pybind11::arg("mode"),
              "0 = OptiX RT cores, 1 = CUDA cores (fan: exact top-k; polar: same threshold, linear scan)")
@@ -819,6 +853,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("set_codeword_weight", [](double w) { ragrt_set_codeword_weight((float)w); },
           "Weight of the codeword term q_s.w in each posting's Stage-2 score: 1 (default) or 0 (centroid-only ablation)");
     m.def("get_codeword_weight", []() { return (double)ragrt_get_codeword_weight(); });
+    m.def("set_compact_scores", [](bool on) { ragrt_set_compact_scores(on ? 1 : 0); },
+          "Stage 2 reads centroid scores as [ntok, k_cent] aligned with topc (true) or [ntok, num_centroids]");
+    m.def("get_compact_scores", []() { return ragrt_get_compact_scores() != 0; });
     m.def("get_rerank_mode", []() { return std::string(ragrt_get_rerank_mode() == 1 ? "wmma" : "simt"); });
     m.def("bruteforce_stage1", &bruteforce_stage1_standalone,
           "Exact top-k positive codewords per ray on CUDA cores: (q [R,3], codewords [32*E,3], k, max_hits) -> (ids, vals, counts)");

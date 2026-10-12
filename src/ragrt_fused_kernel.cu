@@ -71,7 +71,7 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
     int* __restrict__ d_task_qt, int64_t* __restrict__ d_task_offset,
     int* __restrict__ d_task_length, float* __restrict__ d_task_base_score,
     unsigned long long* __restrict__ d_task_start, unsigned long long* __restrict__ d_total_postings,
-    const int* __restrict__ prim_eid, int E, float cw_weight,
+    const int* __restrict__ prim_eid, int E, float cw_weight, int compact_scores,
     unsigned long long* __restrict__ stats
 ) {
     __shared__ int   s_top_eid[WARPS_PER_BLOCK][S2_MAX_EIDS];
@@ -199,7 +199,9 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
                 if (length > 0) {
                     list_found = 1;
                     // cw_weight = 1: q.c + q_s.w (default). 0: centroid-only scoring (ablation; same lists fetched).
-                    float base_score = scores[qt * num_centroids + cid] + cw_weight * s_top_val[warp_in_block][h];
+                    // compact_scores: scores is [ntok, k_cent] (aligned with topc) instead of [ntok, num_centroids]
+                    float cscore = compact_scores ? scores[qt * k_cent + c] : scores[qt * num_centroids + cid];
+                    float base_score = cscore + cw_weight * s_top_val[warp_in_block][h];
                     if (base_score > MIN_BASE_SCORE) {
                         task_found = 1;
                         int64_t b_idx   = found_idx >> 7;
@@ -344,7 +346,8 @@ __global__ void sparse_expand_kernel(
     const unsigned long long* __restrict__ d_task_start, long long cap,
     const uint8_t* __restrict__ map_packed_24, int num_passages,
     const uint32_t* __restrict__ doc_predicates, uint32_t query_mask,
-    unsigned long long sentinel, unsigned long long* __restrict__ keys
+    unsigned long long sentinel, unsigned long long* __restrict__ keys,
+    const uint32_t* __restrict__ tok_ids, const uint8_t* __restrict__ residuals, const float* __restrict__ lut
 ) {
     int total_tasks = *d_num_tasks;
     if (total_tasks > MAX_TASKS) total_tasks = MAX_TASKS;
@@ -356,13 +359,27 @@ __global__ void sparse_expand_kernel(
         int64_t off = d_task_offset[t];
         int len = d_task_length[t];
         unsigned long long start = d_task_start[t];
-        unsigned long long sbits = (unsigned long long)(__half_as_ushort(__float2half(d_task_base_score[t])) & 0x7FFF);
+        float base = d_task_base_score[t];
+        unsigned long long sbits = (unsigned long long)(__half_as_ushort(__float2half(base)) & 0x7FFF);
         unsigned long long tok = ((unsigned long long)qt) << SP_TOK_SHIFT;
+        const float* L = lut ? lut + (size_t)qt * 32 * 256 : nullptr;
         for (int i = lane; i < len; i += 32) {
             long long dst = (long long)start + i;
             if (dst >= cap) break;
             const uint8_t* p24 = map_packed_24 + (off + i) * 3;
             int pid = p24[0] | (p24[1] << 8) | (p24[2] << 16);
+            if (L) {   // per-token score: centroid part + residual part, clamped at the imputed floor (0)
+                const uint4* r4 = reinterpret_cast<const uint4*>(residuals + (size_t)tok_ids[off + i] * 32);
+                uint4 a = r4[0], b2 = r4[1];
+                const uint8_t* rb = reinterpret_cast<const uint8_t*>(&a);
+                const uint8_t* rc = reinterpret_cast<const uint8_t*>(&b2);
+                float sc = base;
+                #pragma unroll
+                for (int j = 0; j < 16; ++j) sc += L[j * 256 + rb[j]];
+                #pragma unroll
+                for (int j = 0; j < 16; ++j) sc += L[(16 + j) * 256 + rc[j]];
+                sbits = (unsigned long long)(__half_as_ushort(__float2half(fmaxf(sc, 0.0f))) & 0x7FFF);
+            }
             unsigned long long k = sentinel;
             if (pid < num_passages && (query_mask == 0 || (doc_predicates[pid] & query_mask) != 0))
                 k = (((unsigned long long)pid) << SP_PID_SHIFT) | tok | sbits;
@@ -631,6 +648,24 @@ static float g_cw_weight = 1.0f;
 extern "C" void ragrt_set_codeword_weight(float w) { g_cw_weight = w; }
 extern "C" float ragrt_get_codeword_weight() { return g_cw_weight; }
 
+// Compact centroid scores: Stage 2 reads scores[qt * k_cent + c] (only the probed centroids' scores,
+// aligned with topc) instead of the full [ntok, num_centroids] matrix. Saves building that matrix.
+static int g_compact_scores = 0;
+extern "C" void ragrt_set_compact_scores(int on) { g_compact_scores = on ? 1 : 0; }
+extern "C" int ragrt_get_compact_scores() { return g_compact_scores; }
+
+// Residual scoring (WARP-style implicit decompression) in sparse Stage 3: each posting is one
+// token (token-level plain-IVF index, csr_token_ids), scored base + sum_j lut[qt][j][residual byte j],
+// where lut[qt][j][b] = sum_k q[qt][4j+k] * bucket_weight[decomp[rbm[b]][k]] (built in Python).
+// All three pointers non-null = on.
+static const uint32_t* g_tok_ids = nullptr;
+static const uint8_t*  g_res = nullptr;
+static const float*    g_res_lut = nullptr;
+extern "C" void ragrt_set_residual_scoring(const uint32_t* tok_ids, const uint8_t* residuals, const float* lut) {
+    g_tok_ids = tok_ids; g_res = residuals; g_res_lut = lut;
+}
+extern "C" int ragrt_residual_scoring_on() { return (g_tok_ids && g_res && g_res_lut) ? 1 : 0; }
+
 extern "C" void ragrt_reset_drop_stats() {
     if (g_d_stats) {
         cudaDeviceSynchronize();
@@ -745,14 +780,14 @@ extern "C" void ragrt_stage2(
             d_csr_row_ptrs, (const uint8_t*)d_csr_col_eids, d_csr_block_sums, d_csr_lengths,
             total_rays, max_hits, k_eids, k_cent, active_ntok, num_centroids,
             B.num_tasks, B.num_dropped, B.task_qt, B.task_offset, B.task_length, B.task_base,
-            B.task_start, B.total_postings, d_prim_eid, E, g_cw_weight, stats_ptr());
+            B.task_start, B.total_postings, d_prim_eid, E, g_cw_weight, g_compact_scores, stats_ptr());
     } else {
         collect_posting_tasks_csr_warp_kernel<uint16_t><<<blocks, threads, 0, stream>>>(
             d_out_c, d_out_v, d_out_hit_count, d_topc, d_scores,
             d_csr_row_ptrs, (const uint16_t*)d_csr_col_eids, d_csr_block_sums, d_csr_lengths,
             total_rays, max_hits, k_eids, k_cent, active_ntok, num_centroids,
             B.num_tasks, B.num_dropped, B.task_qt, B.task_offset, B.task_length, B.task_base,
-            B.task_start, B.total_postings, d_prim_eid, E, g_cw_weight, stats_ptr());
+            B.task_start, B.total_postings, d_prim_eid, E, g_cw_weight, g_compact_scores, stats_ptr());
     }
     if (stats_ptr()) add_postings_stat_kernel<<<1, 1, 0, stream>>>(B.total_postings, stats_ptr());
 }
@@ -800,7 +835,8 @@ extern "C" long long ragrt_stage3_sparse(
     if (P > 0) {
         sparse_expand_kernel<<<1024, threads, 0, stream>>>(
             B.num_tasks, B.task_qt, B.task_offset, B.task_length, B.task_base, B.task_start, P,
-            d_map_packed_24, num_passages, d_doc_predicates, query_mask, sentinel, B.keys_a);
+            d_map_packed_24, num_passages, d_doc_predicates, query_mask, sentinel, B.keys_a,
+            g_tok_ids, g_res, (g_tok_ids && g_res) ? g_res_lut : nullptr);
         size_t tb = B.temp_bytes;
         rcub::DeviceRadixSort::SortKeys(B.temp, tb, B.keys_a, B.keys_b, (int)P, 0, end_bit, stream);
         sparse_tail_values_kernel<<<(unsigned)((P + threads - 1) / threads), threads, 0, stream>>>(

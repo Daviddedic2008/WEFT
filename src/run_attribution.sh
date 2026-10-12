@@ -6,6 +6,8 @@
 #   profile     breakdown + throughput + torch.profiler attribution for every engine in BASE
 #   ivf         build the plain-IVF index (once) and run ragrt_ivf against it -> BASE_ivf
 #   weft        WEFT (plain IVF + native fp16 prep + imputation) and its no-imputation ablation -> BASE_weft
+#   resid       residual-correction ablation: build the token-level plain IVF (once; ~1.4x the
+#               postings + 4 B/posting token ids) and run weft_tok, weft_resid, weft_resid_norr -> BASE_resid
 #   muvera      build MUVERA FDEs (once; needs export_embeddings.py output) and run muvera -> BASE_muvera
 # Disk: plain IVF ~ 3 B x (deduplicated postings), MUVERA 2560 dims ~ 12.4 GB on LoTTE.
 set -euo pipefail
@@ -18,6 +20,7 @@ SCR=/local/scratch/a/cashman3
 cfg() { python3 -c "import eval_config as C; print(C.dataset('$DATASET')['$1'])"; }
 INDEX=$(cfg index); COLL=$(cfg collection); CSR=$(cfg sparse_csr_dir)
 IVF_DIR="$SCR/${DATASET}_plain_ivf"
+TOK_DIR="$SCR/${DATASET}_plain_ivf_tok"
 EMB_DIR="$SCR/${DATASET}_doc_embs"
 MUV_DIR="$SCR/muvera_${DATASET}_r20_k4_p8"
 
@@ -44,6 +47,16 @@ for st in $STEPS; do
           --baseline_from "$ROOT/${BASE}_ivf" --import_engines plaid,ptms,ragrt,ragrt_bf,ragrt_nofilter,ragrt_centroid,ragrt_ivf \
           --engines weft,weft_noimpute --stages sweep,select,test,breakdown,throughput,attribution,filtered,drops
       python3 plot_results.py --dataset "$DATASET" --results_subdir "${BASE}_weft" ;;
+    resid)
+      [ -f "$TOK_DIR/csr_token_ids.npy" ] || python3 build_plain_ivf.py --index "$INDEX" --collection "$COLL" \
+          --src_dir "$CSR" --outdir "$TOK_DIR" --tokens
+      python3 check_index.py "$TOK_DIR"
+      python3 run_benchmarks.py --dataset "$DATASET" --results_subdir "${BASE}_resid" --sparse_csr_dir "$TOK_DIR" \
+          --baseline_from "$ROOT/${BASE}_weft" \
+          --import_engines plaid,ptms,ragrt,ragrt_bf,ragrt_nofilter,ragrt_centroid,ragrt_ivf,weft,weft_noimpute \
+          --core plaid,ptms,weft \
+          --engines weft_tok,weft_resid,weft_resid_norr --stages sweep,select,test,breakdown,throughput,attribution,filtered,drops
+      python3 plot_results.py --dataset "$DATASET" --results_subdir "${BASE}_resid" ;;
     muvera)
       [ -f "$EMB_DIR/doc_embs_fp16.npy" ] || { echo "run export_embeddings.py --dataset $DATASET --outdir $EMB_DIR first"; exit 1; }
       [ -f "$MUV_DIR/fde_docs_fp16.npy" ] || python3 build_muvera_fde.py --emb_dir "$EMB_DIR" --outdir "$MUV_DIR" \

@@ -2,7 +2,7 @@
 CPU tests for the ablation baselines: the plain-IVF CSR (build_plain_ivf.py) and MUVERA FDEs
 (muvera_fde.py). Run: python3 tests/test_ablation_cpu.py
 """
-import os, sys
+import os, sys, itertools
 import numpy as np
 import torch
 
@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import ragrt_index_lib as L
 from build_plain_ivf import plain_ivf_csr
 import muvera_fde as M
-from weft_prep import native_prep, imputed_passage_scores
+from weft_prep import native_prep, imputed_passage_scores, residual_lut, residual_dot_reference
 
 
 def test_plain_ivf(max_len, seed=0):
@@ -36,6 +36,70 @@ def test_plain_ivf(max_len, seed=0):
         assert np.array_equal(got, want), f"centroid {c}"
     assert rp[0, 8] == rp[0, 7], "empty centroid has no lists"
     print(f"  plain IVF (max_len={max_len}): {len(lens)} lists, E_needed={csr['E_needed']}, every centroid matches brute force")
+
+
+def test_plain_ivf_tokens(max_len, seed=1):
+    """Token-level index: one posting per token, token ids aligned with pids, sorted by token in a list."""
+    rng = np.random.default_rng(seed)
+    N, NC = 300, 25
+    doclens = rng.integers(1, 30, N)
+    pids = np.repeat(np.arange(N), doclens)
+    codes = rng.integers(0, NC, len(pids))
+    csr = plain_ivf_csr(codes, pids, NC, max_len=max_len, tokens=True)
+    rp, lens, P, T = csr["row_ptrs"], csr["lengths"], csr["pids_sorted"], csr["token_ids"]
+    assert T.dtype == np.uint32 and len(T) == len(P) == len(codes)
+    assert np.array_equal(np.sort(T.astype(np.int64)), np.arange(len(codes))), "every token exactly once"
+    assert np.array_equal(pids[T.astype(np.int64)], P), "token ids aligned with pids"
+    starts = np.concatenate([[0], np.cumsum(lens)[:-1]])
+    for c in range(NC):
+        lo, hi = rp[0, c], rp[0, c + 1]
+        got = np.concatenate([T[starts[i]:starts[i] + lens[i]] for i in range(lo, hi)]) if hi > lo else np.array([], np.uint32)
+        assert np.array_equal(got.astype(np.int64), np.flatnonzero(codes == c)), f"centroid {c}"
+    print(f"  token-level plain IVF (max_len={max_len}): {len(P)} postings, every centroid's tokens match")
+
+
+def colbert_reversed_bits(i, nbits=2):
+    """ColBERT ResidualCodec.reversed_bit_map entry (bit order reversed within each nbits group)."""
+    mask, z = (1 << nbits) - 1, 0
+    for j in range(8, 0, -nbits):
+        x = (i >> (j - nbits)) & mask
+        y = sum(((x >> (nbits - k - 1)) & 1) << k for k in range(nbits - 1, -1, -1))
+        z |= y
+        if j > nbits:
+            z <<= nbits
+    return z
+
+
+def test_residual_lut(seed=0):
+    """32 LUT lookups == q . decoded 2-bit residual (same decode as ColBERT / the rerank kernel)."""
+    g = torch.Generator().manual_seed(seed)
+    # ColBERT nbits=2 tables: reversed_bit_map reverses the 2-bit groups of a byte; decomp_table
+    # maps a byte to its 4 bucket indices
+    rbm = torch.tensor([colbert_reversed_bits(i) for i in range(256)], dtype=torch.uint8)
+    dt = torch.tensor(list(itertools.product(range(4), repeat=4)), dtype=torch.uint8)     # [256, 4]
+    bw = torch.tensor([-0.031, -0.009, 0.008, 0.030])
+    Q = torch.randn(9, 128, generator=g)
+    lut = residual_lut(Q, bw, rbm, dt)
+    assert lut.shape == (9, 32, 256)
+    res = torch.randint(0, 256, (50, 32), generator=g, dtype=torch.uint8)
+    for t in range(9):
+        for i in range(50):
+            via_lut = float(lut[t, torch.arange(32), res[i].long()].sum())
+            ref = residual_dot_reference(Q[t], res[i], bw, rbm, dt)
+            assert abs(via_lut - ref) < 1e-4, (t, i, via_lut, ref)
+    print("  residual LUT (32 lookups) == q . decoded residual")
+
+
+def test_compact_prep(seed=3):
+    g = torch.Generator().manual_seed(seed)
+    Q = torch.randn(10, 128, generator=g); C = torch.randn(400, 128, generator=g)
+    for impute in (False, True):
+        t1, s1, m1 = native_prep(Q, C, 9, impute)
+        t2, s2, m2 = native_prep(Q, C, 9, impute, compact=True)
+        assert torch.equal(t1, t2) and s2.shape == (10, 9)
+        assert torch.allclose(torch.gather(s1, 1, t1.long()), s2, atol=1e-6)
+        assert (m1 is None) == (m2 is None) and (m1 is None or torch.equal(m1, m2))
+    print("  compact prep == full prep gathered at topc")
 
 
 def test_muvera_matches_reference():
@@ -103,6 +167,10 @@ def test_native_prep_and_imputation(seed=0):
 if __name__ == "__main__":
     test_plain_ivf(max_len=65535)
     test_plain_ivf(max_len=5)            # forces multi-chunk centroids
+    test_plain_ivf_tokens(max_len=65535)
+    test_plain_ivf_tokens(max_len=4)
+    test_residual_lut()
+    test_compact_prep()
     test_muvera_matches_reference()
     test_muvera_tracks_chamfer()
     test_native_prep_and_imputation()

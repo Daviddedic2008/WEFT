@@ -25,18 +25,28 @@ import ragrt_index_lib as L
 COPY = ["svd_rotation_128_to_96.npy", "centroids_96d_svd.npy", "codebook_meta.json", "predicates.npy"]
 
 
-def plain_ivf_csr(codes, pids, num_centroids, max_len=L.MAX_LIST_LENGTH, dedup=True):
+def plain_ivf_csr(codes, pids, num_centroids, max_len=L.MAX_LIST_LENGTH, dedup=True, tokens=False):
     """
-    codes, pids: per token. Returns dict with row_ptrs int64 [32, num_centroids + 1],
-    col_eids, lengths (int64), pids_sorted, E_needed (chunks of the longest centroid).
+    codes, pids: per token (token order = the order of ColBERT's codes / residuals). Returns dict
+    with row_ptrs int64 [32, num_centroids + 1], col_eids, lengths (int64), pids_sorted, E_needed
+    (chunks of the longest centroid). tokens=True: one posting per TOKEN (no dedup), sorted by
+    (centroid, token id), plus token_ids (uint32) aligned with pids_sorted, for residual scoring.
     """
     codes = np.asarray(codes, dtype=np.int64)
     pids = np.asarray(pids, dtype=np.int64)
     assert len(codes) == len(pids)
     assert pids.min() >= 0 and pids.max() <= L.MAX_PID
-    key = (codes << 24) | pids
-    key = np.unique(key) if dedup else np.sort(key)
-    c, p = key >> 24, key & ((1 << 24) - 1)
+    tids = None
+    if tokens:
+        assert len(codes) < (1 << 32)
+        key = np.sort((codes << 32) | np.arange(len(codes), dtype=np.int64))
+        c, tids = key >> 32, (key & 0xFFFFFFFF)
+        p = pids[tids]
+        tids = tids.astype(np.uint32)
+    else:
+        key = (codes << 24) | pids
+        key = np.unique(key) if dedup else np.sort(key)
+        c, p = key >> 24, key & ((1 << 24) - 1)
     per_c = np.bincount(c, minlength=num_centroids).astype(np.int64)
     nchunk = (per_c + max_len - 1) // max_len                     # 0 for empty centroids
     n_lists = int(nchunk.sum())
@@ -55,7 +65,7 @@ def plain_ivf_csr(codes, pids, num_centroids, max_len=L.MAX_LIST_LENGTH, dedup=T
     row_ptrs[0] = row
     row_ptrs[1:] = n_lists                                        # empty subspaces
     return {"row_ptrs": row_ptrs, "col_eids": eids, "lengths": lengths, "pids_sorted": p,
-            "E_needed": int(nchunk.max()) if n_lists else 1}
+            "token_ids": tids, "E_needed": int(nchunk.max()) if n_lists else 1}
 
 
 def main():
@@ -64,6 +74,8 @@ def main():
     ap.add_argument("--collection", required=True)
     ap.add_argument("--src_dir", required=True, help="an existing RAGRT index of the same ColBERT index")
     ap.add_argument("--outdir", required=True)
+    ap.add_argument("--tokens", action="store_true",
+                    help="one posting per token + csr_token_ids.npy (for residual scoring); default dedups per passage")
     args = ap.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -82,13 +94,13 @@ def main():
     print(f"{len(doclens):,} passages, {total:,} tokens, {num_centroids:,} centroids", flush=True)
     del searcher
 
-    csr = plain_ivf_csr(codes, pids, num_centroids)
+    csr = plain_ivf_csr(codes, pids, num_centroids, tokens=args.tokens)
     E_src = np.load(os.path.join(args.src_dir, "codebooks.npy"), mmap_mode="r").shape[1]
     E = max(4, csr["E_needed"])
     if E > min(E_src, L.MAX_EIDS_UINT8):
         sys.exit(f"FATAL: longest centroid needs {E} chunks; the source codebook has E={E_src}")
     n_post = len(csr["pids_sorted"])
-    print(f"{len(csr['lengths']):,} lists, {n_post:,} postings after dedup ({n_post / total:.2f} per token), "
+    print(f"{len(csr['lengths']):,} lists, {n_post:,} postings{'' if args.tokens else ' after dedup'} ({n_post / total:.2f} per token), "
           f"E={E}", flush=True)
 
     lengths = csr["lengths"].astype(np.uint16)
@@ -105,11 +117,13 @@ def main():
     np.save(os.path.join(args.outdir, "csr_lengths.npy"), lengths)
     np.save(os.path.join(args.outdir, "csr_block_sums_128.npy"), bsums)
     np.save(os.path.join(args.outdir, "csr_packed_24.npy"), packed)
+    if args.tokens:
+        np.save(os.path.join(args.outdir, "csr_token_ids.npy"), csr["token_ids"])
     np.save(os.path.join(args.outdir, "codebooks.npy"),
             np.ascontiguousarray(np.load(os.path.join(args.src_dir, "codebooks.npy"))[:, :E]))
     for f in COPY:
         shutil.copy(os.path.join(args.src_dir, f), os.path.join(args.outdir, f))
-    json.dump({"kind": "plain_ivf", "dedup": True, "E": E, "lists": len(lengths), "postings": n_post,
+    json.dump({"kind": "plain_ivf", "dedup": not args.tokens, "tokens": bool(args.tokens), "E": E, "lists": len(lengths), "postings": n_post,
                "src_dir": args.src_dir}, open(os.path.join(args.outdir, "plain_ivf_meta.json"), "w"), indent=1)
     print(f"[DONE] {args.outdir} ({3 * n_post / 1e9:.2f} GB packed). Check: python3 check_index.py {args.outdir}")
 

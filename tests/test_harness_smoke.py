@@ -31,7 +31,9 @@ RNG = np.random.default_rng(0)
 DOCS = torch.tensor(RNG.normal(size=(N_DOCS, DIM)), dtype=torch.float32)
 
 
-FAKE_RAGRT = ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft", "weft_noimpute")
+FAKE_RESID = ("weft_resid", "weft_resid_norr")
+FAKE_RAGRT = ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft", "weft_noimpute",
+              "weft_tok") + FAKE_RESID
 
 
 def cfg_key(engine, p):
@@ -123,6 +125,7 @@ class FakeEngines:
 
 eng_mod = types.ModuleType("engines")
 eng_mod.Engines, eng_mod.cfg_key, eng_mod.RAGRT_ENGINES = FakeEngines, cfg_key, FAKE_RAGRT
+eng_mod.RESID_ENGINES = FAKE_RESID
 sys.modules["engines"] = eng_mod
 
 import eval_config as C
@@ -228,6 +231,26 @@ def main():
     import plot_results
     plot_results.main()
     assert "Attribution chain" in open(os.path.join(src, "ivf", "summary.md")).read()
+
+    # residual-correction ablation on a token-level index, on top of the ivf run
+    sys.argv = ["run_benchmarks.py", "--dataset", "msmarco", "--quick", "--tune_size", "60",
+                "--results_subdir", "resid", "--sparse_csr_dir", C.DATASETS["msmarco"]["sparse_csr_dir"],
+                "--baseline_from", os.path.join(src, "ivf"),
+                "--import_engines", "plaid,ptms,ragrt,ragrt_bf,ragrt_nofilter,ragrt_centroid,ragrt_ivf,weft,weft_noimpute",
+                "--core", "plaid,ptms,weft",
+                "--engines", "weft_tok,weft_resid,weft_resid_norr", "--stages", "sweep,select,test,breakdown,throughput",
+                "--repeats", "1", "--max_filter_queries", "40", "--throughput_queries", "32", "--targets", "0.5,0.9"]
+    run_benchmarks.main()
+    R4 = json.load(open(os.path.join(src, "resid", "results.json")))
+    assert R4["sweep"]["weft"] == R3["sweep"]["weft"], "weft must be imported"
+    assert len(R4["sweep"]["weft_resid_norr"]) == 2 and all(p["params"]["ndocs"] == C.TOP_K for p in R4["sweep"]["weft_resid_norr"])
+    steps = {(a["slow"], a["fast"]) for c in R4["comparisons"].values() for a in c.get("attribution", [])}
+    assert {("weft", "weft_tok"), ("weft_tok", "weft_resid"), ("weft_resid", "weft_resid_norr")} <= steps, steps
+    assert R4["breakdown"]["weft_resid_norr"]["s4_tms"] == 0.0
+    tp = R4["throughput"]
+    assert "weft_tok_pipelined_qps" in tp and not any(k.startswith("weft_resid") and "pipelined" in k for k in tp), tp.keys()
+    sys.argv = ["plot_results.py", "--dataset", "msmarco", "--results_subdir", "resid"]
+    plot_results.main()
 
     sys.argv = ["plot_results.py", "--dataset", "msmarco"]
     plot_results.main()

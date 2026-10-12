@@ -21,6 +21,13 @@ The three retrieval engines behind one interface, for benchmarks and profiling.
              one fp16 GEMM in the native 128 dimensions (no SVD projection), and WARP-style
              missing-score imputation (weft_prep.py). Run on a build_plain_ivf.py index.
   weft_noimpute : weft without the imputation (isolates it; ragrt_ivf vs this isolates the prep).
+  Residual-correction ablation (WARP-style implicit decompression), on a TOKEN-level plain-IVF
+  index (build_plain_ivf.py --tokens: one posting per token, csr_token_ids.npy):
+  weft_tok : weft on the token-level index, no residuals (the cost of not deduplicating).
+  weft_resid : each posting scored q.c + q.r (32 LUT lookups, weft_prep.residual_lut) - m, then
+             the same exact rerank. Tests whether more precise approximate scores cut ndocs.
+  weft_resid_norr : weft_resid without the rerank: the top-k by approximate score, i.e. WARP's
+             pipeline (imputation + implicit decompression, no rerank) ported to the GPU.
   muvera   : MUVERA fixed-dimensional encodings (build_muvera_fde.py), exact GPU inner
              product over all passages, then the same TileMaxSim rerank. Grid: cands.
 
@@ -56,7 +63,7 @@ from colbert.search.strided_tensor import StridedTensor
 from colbert.modeling.colbert import colbert_score_reduce
 import rtrag_corr_3d
 import ragrt_index_lib as L
-from weft_prep import native_prep
+from weft_prep import native_prep, residual_lut
 
 NEG_INF = float("-inf")
 
@@ -69,14 +76,22 @@ def ragrt_cfg_key(p):
     return f"nc={p['nc']} eids={p['eids']} ndocs={p['ndocs']}"
 
 
-RAGRT_ENGINES = ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft", "weft_noimpute")
+WEFT_ENGINES = ("weft", "weft_noimpute", "weft_tok", "weft_resid", "weft_resid_norr")
+RESID_ENGINES = ("weft_resid", "weft_resid_norr")       # need a token-level index (csr_token_ids.npy)
+TOKEN_ENGINES = ("weft_tok",) + RESID_ENGINES
+RAGRT_ENGINES = ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf") + WEFT_ENGINES
 STAGE1_MODE = {"ragrt": 0, "ragrt_bf": 1, "ragrt_nofilter": 2,      # see CorrIndex3D.set_stage1_mode
-               "ragrt_centroid": 1, "ragrt_ivf": 2, "weft": 2, "weft_noimpute": 2}
+               "ragrt_centroid": 1, "ragrt_ivf": 2, **{e: 2 for e in WEFT_ENGINES}}
 CODEWORD_WEIGHT = {"ragrt": 1.0, "ragrt_bf": 1.0, "ragrt_nofilter": 1.0,   # weight of q_s.w in Stage 2
-                   "ragrt_centroid": 0.0, "ragrt_ivf": 0.0, "weft": 0.0, "weft_noimpute": 0.0}
+                   "ragrt_centroid": 0.0, "ragrt_ivf": 0.0, **{e: 0.0 for e in WEFT_ENGINES}}
 # Stage 0b: "svd96" = centroid scores in the 96D SVD space (codebook engines); "native" = fp16 GEMM
-# against the 128D ColBERT centroids; impute = missing-score imputation (weft_prep.py).
-PREP = {"weft": ("native", True), "weft_noimpute": ("native", False)}
+# against the 128D ColBERT centroids; impute = missing-score imputation; compact = scores [ntok, nc]
+# aligned with topc instead of [ntok, num_centroids] (weft_prep.py; identical results).
+# resid = add q.r per posting (residual LUT; token-level index only).
+PREP = {"weft": ("native", True, True, False), "weft_noimpute": ("native", False, True, False),
+        "weft_tok": ("native", True, True, False), "weft_resid": ("native", True, True, True),
+        "weft_resid_norr": ("native", True, True, True)}
+NO_PREP = ("svd96", False, False, False)
 
 
 def muvera_cfg_key(p):
@@ -124,7 +139,8 @@ class Engines:
         self.pred_np = pred.astype(np.uint32)
         self.pred_gpu = torch.from_numpy(self.pred_np.astype(np.int64)).cuda()
 
-        self.prep_mode = ("svd96", False)
+        self.prep_mode = NO_PREP
+        self.has_token_ids = False
         self.index = None
         if load_ragrt:
             self._load_ragrt()
@@ -158,6 +174,12 @@ class Engines:
             self.doc_offsets[:self.N + 1], self.doclens[:self.N], self.codes, self.residuals,
             self.centroids_fp16, self.bucket_weights, self.reversed_bit_map, self.decomp_table,
             torch.from_numpy(self.pred_np.astype(np.int64)).cuda().to(torch.uint32), self.N, self.C96.shape[0])
+        tp = os.path.join(d, "csr_token_ids.npy")
+        if os.path.exists(tp):                  # token-level plain-IVF index (residual ablation)
+            tids = np.load(tp)
+            assert tids.dtype == np.uint32 and int(tids.max()) < self.codes.shape[0], "csr_token_ids out of range"
+            self.index.bind_token_ids(torch.from_numpy(tids.view(np.int32)).cuda())
+            self.has_token_ids = True
 
     def _load_muvera(self, d):
         import muvera_fde as M
@@ -291,9 +313,12 @@ class Engines:
         (scores in the 96D SVD space, or native 128D fp16 with optional imputation: self.prep_mode)."""
         Q96 = torch.nn.functional.normalize(Qf[:ntok].float() @ self.R, p=2, dim=-1)
         Q_sub = Q96.view(ntok, L.NUM_SUBSPACES, L.SUBSPACE_DIM).contiguous()
-        mode, impute = self.prep_mode
+        mode, impute, compact, resid = self.prep_mode
         if mode == "native":
-            topc, scores, _ = native_prep(Qf[:ntok], self.centroids_fp16, nc, impute)
+            topc, scores, _ = native_prep(Qf[:ntok], self.centroids_fp16, nc, impute, compact)
+            if resid:   # read by the next Stage 3 (a global in the extension; one query at a time)
+                self.index.set_residual_lut(residual_lut(Qf[:ntok], self.bucket_weights,
+                                                         self.reversed_bit_map, self.decomp_table))
             return Q_sub, scores, topc
         scores = (Q96 @ self.C96.T).contiguous()
         topc = scores.topk(k=nc, dim=-1).indices.to(torch.int32).contiguous()
@@ -307,10 +332,25 @@ class Engines:
         return self.index.candidates(Q_sub, topc, scores, p["nc"], self.ndocs(p), mask, p["eids"])
 
     def use_engine(self, engine):
-        """Set Stage 1 mode and the Stage 2 codeword weight for a RAGRT engine."""
+        """Set Stage 1 mode, the Stage 2 codeword weight and the prep for a RAGRT engine."""
+        if engine in TOKEN_ENGINES and not self.has_token_ids:
+            raise RuntimeError(f"{engine} needs a token-level index (build_plain_ivf.py --tokens); "
+                               f"{self.ds['sparse_csr_dir']} has no csr_token_ids.npy")
         self.index.set_stage1_mode(STAGE1_MODE[engine])
         rtrag_corr_3d.set_codeword_weight(CODEWORD_WEIGHT[engine])
-        self.prep_mode = PREP.get(engine, ("svd96", False))
+        self.prep_mode = PREP.get(engine, NO_PREP)
+        rtrag_corr_3d.set_compact_scores(self.prep_mode[2])
+        if not self.prep_mode[3]:
+            self.index.set_residual_lut(torch.empty(0))
+
+    @torch.no_grad()
+    def approx_topk(self, Qf, ntok, p, mask=0):
+        """No-rerank search (weft_resid_norr): top-k candidates by approximate score."""
+        cands, approx = self.ragrt_candidates(Qf, ntok, p, mask)
+        ok = cands >= 0
+        cands, approx = cands[ok], approx[ok]
+        top = torch.topk(approx, min(C.TOP_K, cands.numel())).indices
+        return cands[top].tolist()
 
     def resolve(self, engine, p):
         """eids = "all" (ragrt_nofilter, ragrt_ivf) means every codeword of the index."""
@@ -390,6 +430,8 @@ class Engines:
         if engine in RAGRT_ENGINES:
             self.use_engine(engine)
             try:
+                if engine == "weft_resid_norr":
+                    return self.approx_topk(Qf, ntok, self.resolve(engine, p), mask)
                 return self.ragrt(Qf, ntok, self.resolve(engine, p), mask)
             finally:
                 self.use_engine("ragrt")

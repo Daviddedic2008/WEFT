@@ -16,20 +16,50 @@ Query prep (Stage 0b) for the plain-IVF engine, pure torch so it is unit-testabl
     probed centroid's shifted score is >= 0, with equality only on exact ties.)
 
   Returns (topc int32 [ntok, nc], scores float32 [ntok, num_centroids], m float32 [ntok] or None).
+  compact=True returns scores [ntok, nc] aligned with topc instead (Stage 2 reads them with
+  set_compact_scores(True)); it skips building the full float32 matrix.
+
+  residual_lut(Q, bucket_weights, reversed_bit_map, decomp_table)
+    WARP-style implicit decompression for the token-level index: a 2-bit ColBERT residual is
+    32 bytes, byte j holding dims 4j..4j+3 (through reversed_bit_map and decomp_table, exactly as
+    the rerank kernel decodes it). lut[t][j][b] = sum_k Q[t][4j+k] * w[decomp[rbm[b]][k]], so
+    q_t . residual(token) = sum_j lut[t][j][byte_j]: 32 lookups per posting instead of 128 MACs.
+    (No renormalization of centroid + residual, as in WARP.)
 """
 import torch
 
 
-def native_prep(Q, C, nc, impute=False):
+def native_prep(Q, C, nc, impute=False, compact=False):
     s = Q @ C.T                                   # fp16 in, fp16 out (tensor cores on the GPU)
     k = min(nc + (1 if impute else 0), s.shape[1])
     vals, idx = s.topk(k, dim=-1)                 # sorted, best first
     topc = idx[:, :nc].to(torch.int32).contiguous()
+    if compact:
+        v = vals[:, :nc].float()
+        if impute and k > nc:
+            m = vals[:, nc].float()
+            return topc, (v - m[:, None]).contiguous(), m
+        return topc, v.contiguous(), None
     if impute and k > nc:
         m = vals[:, nc].float()
         scores = (s.float() - m[:, None]).contiguous()
         return topc, scores, m
     return topc, s.float().contiguous(), None
+
+
+def residual_lut(Q, bucket_weights, reversed_bit_map, decomp_table):
+    """Q [ntok, 128] -> lut float32 [ntok, 32, 256]."""
+    w = bucket_weights.float()                                         # [4]
+    buckets = decomp_table.long()[reversed_bit_map.long()]             # [256 raw byte, 4 dims]
+    wb = w[buckets]                                                    # [256, 4]
+    Qr = Q.float().view(Q.shape[0], 32, 4)                             # [ntok, 32 bytes, 4 dims]
+    return torch.einsum("tjk,bk->tjb", Qr, wb).contiguous()
+
+
+def residual_dot_reference(q, residual_bytes, bucket_weights, reversed_bit_map, decomp_table):
+    """q [128], residual_bytes [32] uint8 -> q . residual, decoded the way the rerank kernel does."""
+    buckets = decomp_table.long()[reversed_bit_map.long()[residual_bytes.long()]].reshape(-1)   # [128]
+    return float((q.float() * bucket_weights.float()[buckets]).sum())
 
 
 def imputed_passage_scores(best, found, m):

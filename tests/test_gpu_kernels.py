@@ -8,6 +8,10 @@ GPU tests (run on the server after building the extension and the PTX):
 2. Sparse Stage 3 == dense Stage 3 (scores and candidate sets), with and without a filter,
    for 8-bit (E=200) and 16-bit (E=300) eids.
 3. Tensor-core TileMaxSim vs the original kernel vs an fp32 torch reference.
+4. Codeword weight 0 + all codewords == centroid interaction (ragrt_ivf).
+5. Residual scoring on a token-level plain IVF (weft_resid): approximate scores == a torch
+   reference of sum_t max over the passage's probed tokens of max(s_tc - m_t + q_t.r, 0);
+   compact scores == full scores; LUT off == centroid-only scores.
 """
 import os, sys
 import numpy as np
@@ -18,6 +22,8 @@ sys.path.insert(0, os.path.join(HERE, "..", "src"))
 import rtrag_corr_3d as X
 import eval_config as C
 import ragrt_index_lib as L
+from build_plain_ivf import plain_ivf_csr
+from weft_prep import native_prep, residual_lut
 
 S = 32
 dev = "cuda"
@@ -299,6 +305,95 @@ def test_rerank(bind):
     assert ew < 0.02, ew
 
 
+def test_residual_scoring(N=2000, NC=40, E=4, seed=5):
+    rng = np.random.default_rng(seed)
+    doclens = rng.integers(4, 30, N)
+    T = int(doclens.sum())
+    codes = rng.integers(0, NC, T)
+    pids = np.repeat(np.arange(N), doclens)
+    csr = plain_ivf_csr(codes, pids, NC, tokens=True)
+    assert csr["E_needed"] <= E
+    lengths = csr["lengths"].astype(np.uint16)
+    t = lambda a: torch.from_numpy(a).to(dev)
+    residuals = rng.integers(0, 256, (T, 32)).astype(np.uint8)
+    C128 = torch.nn.functional.normalize(torch.randn(NC, 128), dim=-1).half().to(dev)
+    bw = torch.tensor([-0.03, -0.01, 0.01, 0.03]).half().to(dev)
+    rbm = t(rng.permutation(256).astype(np.uint8))
+    dt = t(np.array([[(v >> 6) & 3, (v >> 4) & 3, (v >> 2) & 3, v & 3] for v in range(256)], dtype=np.uint8))
+    doc_off = torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(torch.from_numpy(doclens), 0)]).to(dev)
+    g = torch.Generator(device=dev).manual_seed(seed)
+    idx = X.CorrIndex3D(C.PTX_PATH)
+    idx.build((torch.randn(S, E, 3, device=dev, generator=g) * 0.1).cpu().contiguous(), 0.95, 4)
+    idx.set_geometry(0)
+    idx.bind_index(t(csr["row_ptrs"]), t(csr["col_eids"].astype(L.eid_dtype(E))), t(L.block_sums(lengths)), t(lengths),
+                   t(L.pack_pids_24(csr["pids_sorted"])), doc_off, t(doclens.astype(np.int32)),
+                   t(codes.astype(np.int32)), t(residuals), C128, bw, rbm, dt,
+                   t(np.ones(N, dtype=np.int64)).to(torch.uint32), N, NC)
+    idx.bind_token_ids(t(csr["token_ids"].view(np.int32)))
+    idx.set_stage3_sparse(True)
+    tok_pid = torch.from_numpy(pids).to(dev)
+    tok_code = torch.from_numpy(codes).to(dev)
+    res_bytes = torch.from_numpy(residuals).to(dev).long()            # [T, 32]
+
+    def reference(topc, sc, lut):
+        """sum_t max over the passage's tokens whose centroid is probed by t of max(score + q.r, 0)."""
+        ref = torch.zeros(N, dtype=torch.float64, device=dev)
+        touched = torch.zeros(N, dtype=torch.bool, device=dev)
+        for qt in range(topc.shape[0]):
+            rank = torch.full((NC,), -1, dtype=torch.long, device=dev)
+            rank[topc[qt].long()] = torch.arange(topc.shape[1], device=dev)
+            r = rank[tok_code]
+            hit = r >= 0
+            v = sc[qt][r[hit]].double()
+            if lut is not None:
+                v = v + lut[qt][torch.arange(32, device=dev)[None, :], res_bytes[hit]].sum(1).double()
+            best = torch.zeros(N, dtype=torch.float64, device=dev).scatter_reduce(
+                0, tok_pid[hit], v.clamp_min(0), reduce="amax", include_self=True)
+            ref += best
+            touched[tok_pid[hit]] = True
+        return ref.cpu().numpy(), touched.cpu().numpy()
+
+    try:
+        X.set_codeword_weight(0.0)
+        idx.set_stage1_mode(2)
+        for trial in range(3):
+            nq, nc = 12, 5
+            Qf = torch.nn.functional.normalize(torch.randn(nq, 128, device=dev, generator=g), dim=-1).half()
+            Qs = torch.randn(nq, S, 3, device=dev, generator=g)
+            topc, full, m = native_prep(Qf, C128, nc, impute=True)
+            topc_c, comp, _ = native_prep(Qf, C128, nc, impute=True, compact=True)
+            lut = residual_lut(Qf, bw, rbm, dt)
+            out = {}
+            for name, (sc, compact, L_) in {"full": (full, False, None), "compact": (comp, True, None),
+                                            "resid": (comp, True, lut)}.items():
+                X.set_compact_scores(compact)
+                idx.set_residual_lut(L_ if L_ is not None else torch.empty(0))
+                p, a = idx.candidates(Qs, topc_c if compact else topc, sc, nc, N, 0, E)
+                out[name] = (p.cpu().numpy(), a.cpu().numpy())
+            pf, af = out["full"]; pc, ac = out["compact"]
+            assert np.array_equal(np.sort(pf), np.sort(pc)) and np.allclose(np.sort(af), np.sort(ac), atol=1e-6), \
+                f"trial {trial}: compact scores differ from full scores"
+            ref0, touched = reference(topc_c, comp, None)
+            keep = pc >= 0
+            assert np.abs(ac[keep] - ref0[pc[keep]]).max() < 2e-3 * nq, "centroid-only scores"
+            pr, ar = out["resid"]
+            ref1, _ = reference(topc_c, comp, lut)
+            keep = pr >= 0
+            got = set(pr[keep].tolist())
+            assert set(np.flatnonzero(ref1 > 1e-3).tolist()) <= got <= set(np.flatnonzero(touched).tolist()), \
+                f"trial {trial}: residual candidate set"
+            err = np.abs(ar[keep] - ref1[pr[keep]]).max()
+            assert err < 2e-3 * nq, (trial, err)
+            assert not np.allclose(ar[keep], ref0[pr[keep]], atol=1e-3), "residual LUT had no effect"
+    finally:
+        idx.set_residual_lut(torch.empty(0))
+        X.set_compact_scores(False)
+        X.set_codeword_weight(1.0)
+        idx.set_stage1_mode(0)
+    assert X.get_compact_scores() == 0
+    print(f"  residual scoring (token-level IVF, {T:,} postings) == torch reference; compact == full scores")
+
+
 if __name__ == "__main__":
     for E in (256, 1024, 4096):
         test_stage1(E)
@@ -306,4 +401,5 @@ if __name__ == "__main__":
         idx, bind = test_stage3(E)
     test_rerank(bind)
     test_codeword_weight()
+    test_residual_scoring()
     print("ALL GPU KERNEL TESTS PASSED")
