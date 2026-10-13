@@ -14,6 +14,8 @@
 #               filtered stage on every filter incl. corr_* for plaid and ptms too -> BASE_graph
 #   tue         weft (re-run) vs weft_hash (hash-table Stage 3) and weft_adapt (adaptive probing under
 #               filters), filtered stage, and PLAID / PLAID+TMS post-filter budget sweep -> BASE_tue
+#   wed         weft (re-run) vs weft_pairs (32-bit pair-sort Stage 3) and the revised weft_adapt
+#               (8x cap, 75th-percentile token, cached per-filter counts, fast path) -> BASE_wed
 #   encode      stage 0a: stock ColBERT query encoder vs fast_encoder.py (bench_encode.py)
 #   muvera      build MUVERA FDEs (once; needs export_embeddings.py output) and run muvera -> BASE_muvera
 # Disk: plain IVF ~ 3 B x (deduplicated postings), MUVERA 2560 dims ~ 12.4 GB on LoTTE.
@@ -88,6 +90,16 @@ for st in $STEPS; do
           --core plaid,ptms,weft --engines weft,weft_hash,weft_adapt \
           --stages sweep,select,test,breakdown,throughput,attribution,filtered,filter_budget
       python3 plot_results.py --dataset "$DATASET" --results_subdir "${BASE}_tue" ;;
+    wed)
+      [ -f "$IVF_DIR/csr_packed_24.npy" ] || { echo "run the ivf step first"; exit 1; }
+      PREV="$ROOT/$BASE"
+      for c in "$ROOT/${BASE}_weft" "$ROOT/${BASE}_resid" "$ROOT/${BASE}_graph" "$ROOT/${BASE}_tue"; do [ -f "$c/results.json" ] && PREV="$c"; done
+      python3 run_benchmarks.py --dataset "$DATASET" --results_subdir "${BASE}_wed" --sparse_csr_dir "$IVF_DIR" \
+          --baseline_from "$PREV" \
+          --import_engines plaid,ptms,ragrt,ragrt_bf,ragrt_nofilter,ragrt_centroid,ragrt_ivf,weft_noimpute,weft_tok,weft_resid,weft_resid_norr,weft_graph,weft_hash \
+          --core plaid,ptms,weft --engines weft,weft_pairs,weft_adapt \
+          --stages sweep,select,test,breakdown,throughput,attribution,filtered
+      python3 plot_results.py --dataset "$DATASET" --results_subdir "${BASE}_wed" ;;
     encode)
       python3 bench_encode.py --dataset "$DATASET" --sparse_csr_dir "$IVF_DIR" ;;
     muvera)

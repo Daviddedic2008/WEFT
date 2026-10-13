@@ -84,6 +84,8 @@ extern "C" int  ragrt_get_rerank_mode();
 extern "C" void ragrt_set_codeword_weight(float w);
 extern "C" float ragrt_get_codeword_weight();
 extern "C" void ragrt_set_stage3_hash(int on);
+extern "C" void ragrt_set_stage3_mode(int mode);
+extern "C" int ragrt_get_stage3_mode();
 extern "C" int ragrt_get_stage3_hash();
 extern "C" void ragrt_set_compact_scores(int on);
 extern "C" int ragrt_get_compact_scores();
@@ -844,6 +846,7 @@ public:
         d["codeword_weight"] = ragrt_get_codeword_weight();
         d["compact_scores"] = ragrt_get_compact_scores();
         d["stage3_hash"] = ragrt_get_stage3_hash();
+        d["stage3_mode"] = ragrt_get_stage3_mode();
         d["residual_scoring"] = ragrt_residual_scoring_on();
         d["token_level_index"] = b_token_ids.defined();
         pybind11::list lv;
@@ -949,6 +952,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("set_stage3_hash", [](bool on) { ragrt_set_stage3_hash(on ? 1 : 0); },
           "sparse Stage 3 by hash tables (true) instead of a radix sort (false, default)");
     m.def("get_stage3_hash", []() { return ragrt_get_stage3_hash() != 0; });
+    m.def("set_stage3_mode", [](int mode) { ragrt_set_stage3_mode(mode); },
+          "sparse Stage 3: 0 = 64-bit key radix sort (default), 1 = hash tables, 2 = 32-bit key / 16-bit value pair sort");
+    m.def("get_stage3_mode", []() { return ragrt_get_stage3_mode(); });
     m.def("get_rerank_mode", []() { return std::string(ragrt_get_rerank_mode() == 1 ? "wmma" : "simt"); });
     m.def("bruteforce_stage1", &bruteforce_stage1_standalone,
           "Exact top-k positive codewords per ray on CUDA cores: (q [R,3], codewords [32*E,3], k, max_hits) -> (ids, vals, counts)");

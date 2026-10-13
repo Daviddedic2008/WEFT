@@ -54,7 +54,7 @@ CORE = ["plaid", "ptms", "ragrt"]          # the primary operating point must be
 # ablations: no-RT Stage 1; codebook filter off; no codeword score; plain IVF on RAGRT kernels; MUVERA
 ENGINES = CORE + ["ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft_noimpute", "weft",
                   "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph",
-                  "weft_hash", "weft_adapt", "muvera"]
+                  "weft_hash", "weft_adapt", "weft_pairs", "muvera"]
 # (slow, fast, what the step from slow to fast changes); ratio = latency(slow) / latency(fast)
 ATTRIBUTION = [
     ("ptms", "ragrt_ivf", "engine: PLAID candidate generation -> same algorithm on RAGRT kernels"),
@@ -78,6 +78,8 @@ ATTRIBUTION = [
     ("ptms", "weft_graph", "WEFT (graphs) vs PLAID+TMS"),
     ("weft", "weft_hash", "hash-table Stage 3 instead of a radix sort"),
     ("ptms", "weft_hash", "WEFT (hash Stage 3) vs PLAID+TMS"),
+    ("weft", "weft_pairs", "32-bit key / 16-bit value pair sort instead of 64-bit keys"),
+    ("ptms", "weft_pairs", "WEFT (pair sort) vs PLAID+TMS"),
 ]
 # filter_budget stage: PLAID / PLAID+TMS post-filtering with growing candidate budgets
 FILTER_BUDGETS = [{"ncells": 2, "threshold": 0.45, "ndocs": 1024}, {"ncells": 4, "threshold": 0.4, "ndocs": 4096},
@@ -263,7 +265,7 @@ class Bench:
         grids = {"plaid": plaid_grid, "ptms": plaid_grid, "ragrt": ragrt_grid, "ragrt_bf": ragrt_grid,
                  "ragrt_nofilter": nof, "ragrt_centroid": ragrt_grid, "ragrt_ivf": nof,
                  "weft": nof, "weft_noimpute": nof, "weft_tok": nof, "weft_resid": nof,
-                 "weft_resid_norr": NORR_GRID[:2] if self.args.quick else NORR_GRID, "weft_graph": nof, "weft_hash": nof, "weft_adapt": nof,
+                 "weft_resid_norr": NORR_GRID[:2] if self.args.quick else NORR_GRID, "weft_graph": nof, "weft_hash": nof, "weft_adapt": nof, "weft_pairs": nof,
                  "muvera": MUVERA_GRID[:2] if self.args.quick else MUVERA_GRID}
         if PLAID_DEFAULT_K100 not in grids["plaid"]:
             grids["plaid"] = grids["plaid"] + [PLAID_DEFAULT_K100]

@@ -33,7 +33,7 @@ DOCS = torch.tensor(RNG.normal(size=(N_DOCS, DIM)), dtype=torch.float32)
 
 FAKE_RESID = ("weft_resid", "weft_resid_norr")
 FAKE_RAGRT = ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft", "weft_noimpute",
-              "weft_tok", "weft_graph", "weft_hash", "weft_adapt") + FAKE_RESID
+              "weft_tok", "weft_graph", "weft_hash", "weft_adapt", "weft_pairs") + FAKE_RESID
 
 
 def cfg_key(engine, p):

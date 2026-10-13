@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <math.h>
+#include <algorithm>
 
 namespace rcub = ::ragrt_cub::cub;
 
@@ -535,6 +536,83 @@ __global__ void hash_compact_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage 3, 32-bit pairs: key = pid << 5 | token (uint32), value = fp16 score bits (uint16).
+// About 4 radix passes over 6-byte items instead of ~6 over 8-byte keys; the max per
+// (pid, token) becomes a reduce-by-key (scores are no longer ordered inside a run).
+// ---------------------------------------------------------------------------
+#define K32_SENTINEL 0xFFFFFFFFu
+
+__global__ void sparse_expand32_kernel(
+    const int* __restrict__ d_num_tasks,
+    const int* __restrict__ d_task_qt, const int64_t* __restrict__ d_task_offset,
+    const int* __restrict__ d_task_length, const float* __restrict__ d_task_base_score,
+    const unsigned long long* __restrict__ d_task_start, long long cap,
+    const uint8_t* __restrict__ map_packed_24, int num_passages,
+    const uint32_t* __restrict__ doc_predicates, uint32_t query_mask,
+    uint32_t* __restrict__ keys, uint16_t* __restrict__ vals,
+    const uint32_t* __restrict__ tok_ids, const uint8_t* __restrict__ residuals, const float* __restrict__ lut
+) {
+    int total_tasks = *d_num_tasks;
+    if (total_tasks > MAX_TASKS) total_tasks = MAX_TASKS;
+    int lane = threadIdx.x % 32;
+    int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int nwarps = (gridDim.x * blockDim.x) / 32;
+    for (int t = warp; t < total_tasks; t += nwarps) {
+        int qt = d_task_qt[t];
+        int64_t off = d_task_offset[t];
+        int len = d_task_length[t];
+        unsigned long long start = d_task_start[t];
+        float base = d_task_base_score[t];
+        uint16_t sbits = (uint16_t)(__half_as_ushort(__float2half(base)) & 0x7FFF);
+        const float* L = lut ? lut + (size_t)qt * 32 * 256 : nullptr;
+        for (int i = lane; i < len; i += 32) {
+            long long dst = (long long)start + i;
+            if (dst >= cap) break;
+            const uint8_t* p24 = map_packed_24 + (off + i) * 3;
+            int pid = p24[0] | (p24[1] << 8) | (p24[2] << 16);
+            uint16_t sb = sbits;
+            if (L) {
+                const uint4* r4 = reinterpret_cast<const uint4*>(residuals + (size_t)tok_ids[off + i] * 32);
+                uint4 a = r4[0], b2 = r4[1];
+                const uint8_t* rb = reinterpret_cast<const uint8_t*>(&a);
+                const uint8_t* rc = reinterpret_cast<const uint8_t*>(&b2);
+                float sc = base;
+                #pragma unroll
+                for (int j = 0; j < 16; ++j) sc += L[j * 256 + rb[j]];
+                #pragma unroll
+                for (int j = 0; j < 16; ++j) sc += L[(16 + j) * 256 + rc[j]];
+                sb = (uint16_t)(__half_as_ushort(__float2half(fmaxf(sc, 0.0f))) & 0x7FFF);
+            }
+            bool ok = pid < num_passages && (query_mask == 0 || (doc_predicates[pid] & query_mask) != 0);
+            keys[dst] = ok ? (((uint32_t)pid << 5) | (uint32_t)qt) : K32_SENTINEL;
+            vals[dst] = ok ? sb : (uint16_t)0;
+        }
+    }
+}
+
+// (pid, token) runs -> (pid, float max). Entries past the run count, and the sentinel run, get an
+// out-of-range pid (the final fixup turns them into padding).
+__global__ void pairs_to_pid_kernel(
+    const uint32_t* __restrict__ ukeys, const uint16_t* __restrict__ umax, const int* __restrict__ d_runs,
+    long long n, int* __restrict__ pid_out, float* __restrict__ val_out
+) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int r = *d_runs;
+    if (i < r && ukeys[i] != K32_SENTINEL) {
+        pid_out[i] = (int)(ukeys[i] >> 5);
+        val_out[i] = __half2float(__ushort_as_half(umax[i]));
+    } else {
+        pid_out[i] = 0x7FFFFFFF;
+        val_out[i] = 0.0f;
+    }
+}
+
+struct MaxOpU16 {
+    __device__ __forceinline__ uint16_t operator()(const uint16_t& a, const uint16_t& b) const { return a > b ? a : b; }
+};
+
 struct SumOp {
     __device__ __forceinline__ float operator()(const float& a, const float& b) const { return a + b; }
 };
@@ -777,10 +855,13 @@ static float g_cw_weight = 1.0f;
 extern "C" void ragrt_set_codeword_weight(float w) { g_cw_weight = w; }
 extern "C" float ragrt_get_codeword_weight() { return g_cw_weight; }
 
-// Stage 3 implementation for ragrt_stage3_sparse: 0 = radix sort (default), 1 = hash tables.
-static int g_stage3_hash = 0;
-extern "C" void ragrt_set_stage3_hash(int on) { g_stage3_hash = on ? 1 : 0; }
-extern "C" int ragrt_get_stage3_hash() { return g_stage3_hash; }
+// Stage 3 implementation for ragrt_stage3_sparse: 0 = 64-bit key radix sort (default),
+// 1 = hash tables, 2 = 32-bit key / 16-bit value pair sort.
+static int g_stage3_mode = 0;
+extern "C" void ragrt_set_stage3_hash(int on) { g_stage3_mode = on ? 1 : 0; }
+extern "C" int ragrt_get_stage3_hash() { return g_stage3_mode == 1; }
+extern "C" void ragrt_set_stage3_mode(int mode) { g_stage3_mode = (mode >= 0 && mode <= 2) ? mode : 0; }
+extern "C" int ragrt_get_stage3_mode() { return g_stage3_mode; }
 
 // Compact centroid scores: Stage 2 reads scores[qt * k_cent + c] (only the probed centroids' scores,
 // aligned with topc) instead of the full [ntok, num_centroids] matrix. Saves building that matrix.
@@ -832,7 +913,7 @@ struct Bufs {
     // sparse stage 3 (grown on demand)
     long long sp_cap = 0;
     unsigned long long *keys_a = nullptr, *keys_b = nullptr;
-    int *run_pid_in = nullptr, *run_pid_out = nullptr, *num_runs = nullptr;
+    int *run_pid_in = nullptr, *run_pid_out = nullptr, *num_runs = nullptr, *num_runs1 = nullptr;
     float *val_in = nullptr, *sums = nullptr;
     void* temp = nullptr; size_t temp_bytes = 0;
 };
@@ -851,6 +932,7 @@ static void ensure_task_bufs(int b) {
     cudaMalloc(&B.task_start, MAX_TASKS * sizeof(unsigned long long));
     cudaMalloc(&B.total_postings, sizeof(unsigned long long));
     cudaMalloc(&B.num_runs, sizeof(int));
+    cudaMalloc(&B.num_runs1, sizeof(int));
     cudaMallocHost(&B.h_total, sizeof(unsigned long long));
     B.init = true;
 }
@@ -880,7 +962,12 @@ static void ensure_sparse(int b, long long need, cudaStream_t stream) {
         rcub::DeviceRadixSort::SortKeys(nullptr, t1, B.keys_a, B.keys_b, (int)cap, 0, 64, stream);
         rcub::DeviceReduce::ReduceByKey(nullptr, t2, B.run_pid_in, B.run_pid_out, B.val_in, B.sums,
                                         B.num_runs, SumOp(), (int)cap, stream);
-        B.temp_bytes = (t1 > t2 ? t1 : t2);
+        size_t t3 = 0, t4 = 0;     // 32-bit pair path (keys_a / keys_b reinterpreted: 4 B keys + 2 B values)
+        uint32_t* k32 = reinterpret_cast<uint32_t*>(B.keys_a);
+        uint16_t* v16 = reinterpret_cast<uint16_t*>(k32 + cap);
+        rcub::DeviceRadixSort::SortPairs(nullptr, t3, k32, k32, v16, v16, (int)cap, 0, 32, stream);
+        rcub::DeviceReduce::ReduceByKey(nullptr, t4, k32, k32, v16, v16, B.num_runs1, MaxOpU16(), (int)cap, stream);
+        B.temp_bytes = std::max(std::max(t1, t2), std::max(t3, t4));
         cudaMalloc(&B.temp, B.temp_bytes);
         B.sp_cap = cap;
     }
@@ -957,7 +1044,49 @@ extern "C" long long ragrt_stage3_sparse(
     cudaMemcpyAsync(B.h_total, B.total_postings, sizeof(unsigned long long), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
     long long P = (long long)(*B.h_total);
-    if (g_stage3_hash) {
+    if (g_stage3_mode == 2) {
+        ensure_sparse(buf_idx, (P > min_len ? P : min_len) + 1, stream);
+        int pid_bits = 1;
+        while ((1LL << pid_bits) <= (long long)num_passages) ++pid_bits;
+        int end_bit = 5 + pid_bits;          // the sentinel's low end_bit bits are all ones: it sorts last
+        long long capk = B.sp_cap;
+        uint32_t* ka = reinterpret_cast<uint32_t*>(B.keys_a);
+        uint16_t* va = reinterpret_cast<uint16_t*>(ka + capk);
+        uint32_t* kb = reinterpret_cast<uint32_t*>(B.keys_b);
+        uint16_t* vb = reinterpret_cast<uint16_t*>(kb + capk);
+        uint32_t* uk = reinterpret_cast<uint32_t*>(B.run_pid_out);
+        uint16_t* um = reinterpret_cast<uint16_t*>(B.sums);
+        int threads = 256;
+        long long U = 0;
+        if (P > 0) {
+            sparse_expand32_kernel<<<1024, threads, 0, stream>>>(
+                B.num_tasks, B.task_qt, B.task_offset, B.task_length, B.task_base, B.task_start, P,
+                d_map_packed_24, num_passages, d_doc_predicates, query_mask, ka, va,
+                g_tok_ids, g_res, (g_tok_ids && g_res) ? g_res_lut : nullptr);
+            size_t tb = B.temp_bytes;
+            rcub::DeviceRadixSort::SortPairs(B.temp, tb, ka, kb, va, vb, (int)P, 0, end_bit, stream);
+            tb = B.temp_bytes;
+            rcub::DeviceReduce::ReduceByKey(B.temp, tb, kb, uk, vb, um, B.num_runs1, MaxOpU16(), (int)P, stream);
+            pairs_to_pid_kernel<<<(unsigned)((P + threads - 1) / threads), threads, 0, stream>>>(
+                uk, um, B.num_runs1, P, B.run_pid_in, B.val_in);
+            tb = B.temp_bytes;
+            rcub::DeviceReduce::ReduceByKey(B.temp, tb, B.run_pid_in, B.run_pid_out, B.val_in, B.sums,
+                                            B.num_runs, SumOp(), (int)P, stream);
+            cudaMemcpyAsync(B.h_total, B.num_runs, sizeof(int), cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            U = *reinterpret_cast<int*>(B.h_total);
+        } else {
+            cudaMemsetAsync(B.num_runs, 0, sizeof(int), stream);
+        }
+        long long L = U > min_len ? U : min_len;
+        sparse_fixup_kernel<<<(unsigned)((L + threads - 1) / threads), threads, 0, stream>>>(
+            B.num_runs, L, num_passages, B.run_pid_out, B.sums);
+        *d_pids = B.run_pid_out;
+        *d_sums = B.sums;
+        *n_valid = U;
+        return L;
+    }
+    if (g_stage3_mode == 1) {
         // tables of 2^k >= 2P slots (load <= 0.5); table 1 in keys_a (8 B/slot), table 2 in run_pid_in / val_in
         int log2cap = 16;
         while ((1LL << log2cap) < 2 * P) ++log2cap;

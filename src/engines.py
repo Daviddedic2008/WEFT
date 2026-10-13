@@ -31,6 +31,8 @@ The three retrieval engines behind one interface, for benchmarks and profiling.
   weft_graph : weft run as two CUDA graph replays with one mid-query sync (graph_search.py):
              same candidates and results as weft, less launch and sync overhead.
   weft_hash : weft with the hash-table Stage 3 (no radix sort): same scores, less Stage-3 time.
+  weft_pairs : weft with the 32-bit-key pair sort in Stage 3 (pid<<5|token keys, fp16 values):
+             fewer, narrower radix passes; a reduce-by-key takes the max per (passage, token).
   weft_adapt : weft + adaptive probing under a filter: when the probed centroids' lists hold fewer
              passing postings than an uncorrelated filter would (per-centroid filter-bit counts,
              centroid_bit_counts.npy), probe up to ADAPT_CAP x nc centroids (anti-correlated filters).
@@ -82,10 +84,13 @@ def ragrt_cfg_key(p):
     return f"nc={p['nc']} eids={p['eids']} ndocs={p['ndocs']}"
 
 
-WEFT_ENGINES = ("weft", "weft_noimpute", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "weft_hash", "weft_adapt")
+WEFT_ENGINES = ("weft", "weft_noimpute", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "weft_hash",
+                "weft_adapt", "weft_pairs")
 HASH_ENGINES = ("weft_hash",)
+PAIRS_ENGINES = ("weft_pairs",)
 ADAPT_ENGINES = ("weft_adapt",)          # per-query nc: no batched pipeline
-ADAPT_CAP = 4
+ADAPT_CAP = 8                            # probe at most ADAPT_CAP x nc centroids
+ADAPT_Q = 0.75                           # quantile of the tokens' needed nc (1.0 = max)
 GRAPH_ENGINES = ("weft_graph",)          # CUDA-graph path: no per-stage profile, no batched pipeline
 RESID_ENGINES = ("weft_resid", "weft_resid_norr")       # need a token-level index (csr_token_ids.npy)
 TOKEN_ENGINES = ("weft_tok",) + RESID_ENGINES
@@ -101,7 +106,8 @@ CODEWORD_WEIGHT = {"ragrt": 1.0, "ragrt_bf": 1.0, "ragrt_nofilter": 1.0,   # wei
 PREP = {"weft": ("native", True, True, False), "weft_noimpute": ("native", False, True, False),
         "weft_tok": ("native", True, True, False), "weft_resid": ("native", True, True, True),
         "weft_resid_norr": ("native", True, True, True), "weft_graph": ("native", True, True, False),
-        "weft_hash": ("native", True, True, False), "weft_adapt": ("native", True, True, False)}
+        "weft_hash": ("native", True, True, False), "weft_adapt": ("native", True, True, False),
+        "weft_pairs": ("native", True, True, False)}
 NO_PREP = ("svd96", False, False, False)
 
 
@@ -163,6 +169,7 @@ class Engines:
         self.cur_mask = 0
         self.cbc = None                 # per-centroid filter-bit counts (weft_adapt)
         self.sel_cache = {}
+        self.pass_cache = {}
         self.adapt_log = []
         self.zero_sub = None
         self.res_wb = None
@@ -411,10 +418,13 @@ class Engines:
         if self.cbc is None:
             c = torch.from_numpy(self.centroid_bit_counts()).cuda()
             self.cbc = {"bits": c[:, :32].float(), "tot": c[:, 32].float()}
-        bits = torch.tensor([float((mask >> b) & 1) for b in range(32)], device=self.cbc["bits"].device)
-        pass_c = self.cbc["bits"] @ bits                                   # [NC]
+        pass_c = self.pass_cache.get(mask)
+        if pass_c is None:                                                 # per filter mask, once
+            bits = torch.tensor([float((mask >> b) & 1) for b in range(32)], device=self.cbc["bits"].device)
+            pass_c = self.pass_cache[mask] = self.cbc["bits"] @ bits      # [NC]
         ncap = min(ADAPT_CAP * nc, self.centroids_fp16.shape[0] - 1)
-        topc, scores, nc2 = adaptive_probe(Q, self.centroids_fp16, nc, ncap, pass_c, self.cbc["tot"], self.selectivity(mask))
+        topc, scores, nc2 = adaptive_probe(Q, self.centroids_fp16, nc, ncap, pass_c, self.cbc["tot"],
+                                           self.selectivity(mask), q=ADAPT_Q)
         self.last_adapt_nc = nc2
         self.adapt_log.append(nc2)
         return topc, scores
@@ -436,7 +446,7 @@ class Engines:
         rtrag_corr_3d.set_codeword_weight(CODEWORD_WEIGHT[engine])
         self.prep_mode = PREP.get(engine, NO_PREP)
         rtrag_corr_3d.set_compact_scores(self.prep_mode[2])
-        rtrag_corr_3d.set_stage3_hash(engine in HASH_ENGINES)
+        rtrag_corr_3d.set_stage3_mode(2 if engine in PAIRS_ENGINES else (1 if engine in HASH_ENGINES else 0))
         self.adapt = engine in ADAPT_ENGINES
         if not self.prep_mode[3]:
             self.index.set_residual_lut(torch.empty(0))

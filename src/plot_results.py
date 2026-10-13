@@ -35,9 +35,10 @@ STYLE = {
     "weft_graph": {"color": "#000060", "marker": "*", "label": "WEFT, CUDA graphs"},
     "weft_hash": {"color": "#2f4b7c", "marker": "P", "label": "WEFT, hash Stage 3"},
     "weft_adapt": {"color": "#665191", "marker": "X", "label": "WEFT, adaptive probing"},
+    "weft_pairs": {"color": "#003f5c", "marker": "v", "label": "WEFT, 32-bit pair sort"},
 }
 ALL_ENGINES = ["plaid", "ptms", "ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf",
-               "weft_noimpute", "weft", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "weft_hash", "weft_adapt", "muvera"]
+               "weft_noimpute", "weft", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "weft_hash", "weft_adapt", "weft_pairs", "muvera"]
 ENGINES = ALL_ENGINES          # narrowed in main() to the engines present in results.json
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 
@@ -127,7 +128,7 @@ def fig_breakdown(R, out):
                         ("weft_noimpute", "WEFT, no imputation", "1 all"), ("weft", "WEFT", "1 all"),
                         ("weft_tok", "WEFT token index", "1 all"), ("weft_resid", "WEFT + residuals", "1 all"),
                         ("weft_resid_norr", "WARP-style, no rerank", "1 all"), ("weft_hash", "WEFT, hash Stage 3", "1 all"),
-                        ("weft_adapt", "WEFT, adaptive", "1 all")):
+                        ("weft_adapt", "WEFT, adaptive", "1 all"), ("weft_pairs", "WEFT, pair sort", "1 all")):
         if e in b:
             r = b[e]
             bars.append((name, [("0b prep", r["s0b_prep"]), (s1, r["s1_rt"]), ("2 gather", r["s2_gather"]),

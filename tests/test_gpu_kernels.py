@@ -14,8 +14,9 @@ GPU tests (run on the server after building the extension and the PTX):
    compact scores == full scores; LUT off == centroid-only scores.
 6. CUDA-graph path (graph_search.py, engine weft_graph) returns the same results as the eager
    WEFT path, with and without a filter, across graph re-use and capacity buckets.
-7. Hash-table Stage 3 (weft_hash) == radix-sort Stage 3: same touched passages, same scores
-   (up to float summation order), with and without a filter, with and without residual scoring.
+7. Hash-table Stage 3 (weft_hash) and the 32-bit pair sort (weft_pairs) == the 64-bit radix-sort
+   Stage 3: same touched passages, same scores (up to float summation order), with and without a
+   filter, with and without residual scoring.
 """
 import os, sys
 import numpy as np
@@ -493,23 +494,25 @@ def test_hash_stage3(N=3000, NC=40, E=4, seed=11):
                 topc, sc, _ = native_prep(Qf, C128, nc, impute=True, compact=True)
                 idx.set_residual_lut(residual_lut(Qf, bw, rbm, dt) if tokens else torch.empty(0))
                 out = {}
-                for hsh in (False, True):
-                    X.set_stage3_hash(hsh)
+                for mode in (0, 1, 2):
+                    X.set_stage3_mode(mode)
                     p, a = idx.candidates(torch.zeros(nq, S, 3, device=dev), topc, sc, nc, N, mask, E)
                     p, a = p.cpu().numpy(), a.cpu().numpy()
                     keep = p >= 0
-                    out[hsh] = dict(zip(p[keep].tolist(), a[keep].tolist()))
-                assert set(out[False]) == set(out[True]), (tokens, trial, len(out[False]), len(out[True]))
-                d = max((abs(out[False][k] - out[True][k]) for k in out[False]), default=0.0)
-                assert d < 1e-4 * nq, (tokens, trial, d)
-                if mask:
-                    assert all(pred[k] & mask for k in out[True]), "hash path let a failing passage through"
+                    out[mode] = dict(zip(p[keep].tolist(), a[keep].tolist()))
+                for mode in (1, 2):
+                    assert set(out[0]) == set(out[mode]), (mode, tokens, trial, len(out[0]), len(out[mode]))
+                    d = max((abs(out[0][k] - out[mode][k]) for k in out[0]), default=0.0)
+                    assert d < 1e-4 * nq, (mode, tokens, trial, d)
+                    if mask:
+                        assert all(pred[k] & mask for k in out[mode]), f"stage-3 mode {mode} let a failing passage through"
                 checked += 1
         finally:
-            X.set_stage3_hash(False); X.set_codeword_weight(1.0); X.set_compact_scores(False)
+            X.set_stage3_mode(0); X.set_codeword_weight(1.0); X.set_compact_scores(False)
             idx.set_residual_lut(torch.empty(0)); idx.set_stage1_mode(0)
-    assert not X.get_stage3_hash()
-    print(f"  hash-table Stage 3 == radix-sort Stage 3 on {checked} queries (dedup + token-level/residual, with/without filter)")
+    assert X.get_stage3_mode() == 0
+    print(f"  hash-table and 32-bit pair-sort Stage 3 == 64-bit radix-sort Stage 3 on {checked} queries "
+          f"(dedup + token-level/residual, with/without filter)")
 
 
 if __name__ == "__main__":

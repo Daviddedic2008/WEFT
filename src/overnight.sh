@@ -5,6 +5,7 @@
 # Steps (default: build gpu_tests attribution phrt muvera fastplaid4):
 #   fastplaid2 build gpu_tests cpu_tests attribution phrt muvera fastplaid4 msmarco_check
 #   lotte_corr lotte_graph msmarco_encode msmarco_corr msmarco_graph lotte_tue msmarco_tue
+#   lotte_wed msmarco_wed warp_setup warp_index warp_search
 # Progress: cat ~/overnight/STATUS
 set -u
 cd "$(dirname "$0")"
@@ -69,6 +70,12 @@ for st in $STEPS; do case "$st" in
   # Oct 13 queue: hash Stage 3, adaptive probing, post-filter budget sweep
   lotte_tue)      [ $BOK = 1 ] && step lotte_tue   "./run_attribution.sh lotte v3_ablation tue" ;;
   msmarco_tue)    [ $BOK = 1 ] && step msmarco_tue "./run_attribution.sh msmarco v1 tue" ;;
+  # Oct 13 night: pair-sort Stage 3, revised adaptive probing, WARP + XTR baseline (own venv)
+  lotte_wed)      [ $BOK = 1 ] && step lotte_wed   "./run_attribution.sh lotte v3_ablation wed" ;;
+  msmarco_wed)    [ $BOK = 1 ] && step msmarco_wed "./run_attribution.sh msmarco v1 wed" ;;
+  warp_setup)     step warp_setup  "./baselines/run_warp.sh setup" ;;
+  warp_index)     step warp_index  "./baselines/run_warp.sh index" ;;
+  warp_search)    step warp_search "./baselines/run_warp.sh search" ;;
   *) echo "unknown step $st" | tee -a "$STATUS" ;;
 esac; done
 echo "== finished $(date)" | tee -a "$STATUS"

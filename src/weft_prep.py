@@ -72,18 +72,26 @@ def imputed_passage_scores(best, found, m):
     return torch.where(found, best, m[None, :]).sum(1)
 
 
-def adaptive_probe(Q, C, nc, ncap, pass_c, tot_c, sel):
+def adaptive_probe(Q, C, nc, ncap, pass_c, tot_c, sel, q=1.0):
     """Adaptive probing under a filter (engine weft_adapt). pass_c / tot_c [NC]: postings per centroid
     whose passage passes the filter / all postings; sel: global pass rate. For each query token the
     target is sel x (postings in its top-nc lists), the passing postings an uncorrelated filter would
     leave; the token needs the smallest nc' in [nc, ncap] whose top-nc' lists hold that many passing
-    postings. Uses the largest nc' over tokens (one k_cent per query), imputation at the (nc'+1)-th
-    score. Returns (topc int32 [ntok, nc'], compact shifted scores float32 [ntok, nc'], nc')."""
+    postings. The query uses the q-quantile of the tokens' nc' (q = 1: the max; one k_cent per query),
+    imputation at the (nc'+1)-th score.
+    Fast path: when at most a (1 - q) share of tokens is short at nc, nc' = nc and no deeper top-k runs.
+    Returns (topc int32 [ntok, nc'], compact shifted scores float32 [ntok, nc'], nc')."""
     s = Q @ C.T
-    vals, idx = s.topk(ncap + 1, dim=-1)
+    vals, idx = s.topk(nc + 1, dim=-1)
     target = sel * tot_c[idx[:, :nc]].sum(1)
-    cum = pass_c[idx[:, :ncap]].cumsum(1)
-    need = (cum < target[:, None]).sum(1) + 1
-    nc2 = int(need.clamp(nc, ncap).max())
+    short = (pass_c[idx[:, :nc]].sum(1) < target).float().mean()
+    if float(short) <= 1.0 - q + 1e-9:
+        nc2 = nc
+    else:
+        vals, idx = s.topk(ncap + 1, dim=-1)
+        cum = pass_c[idx[:, :ncap]].cumsum(1)
+        need = ((cum < target[:, None]).sum(1) + 1).clamp(nc, ncap).float()
+        nc2 = int(torch.quantile(need, q).ceil()) if q < 1.0 else int(need.max())
+        nc2 = max(nc, min(ncap, nc2))
     m = vals[:, nc2].float()
     return idx[:, :nc2].to(torch.int32).contiguous(), (vals[:, :nc2].float() - m[:, None]).contiguous(), nc2

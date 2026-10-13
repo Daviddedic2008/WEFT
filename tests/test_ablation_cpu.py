@@ -164,6 +164,13 @@ def test_adaptive_probe():
     # positively correlated: everything near the query passes -> nc unchanged
     t, s, n = adaptive_probe(Q, C, nc, ncap, torch.where(near, 100.0, 0.0), tot, 0.06)
     assert n == nc
+    # quantile over tokens: only one token is starved -> q = 0.75 keeps nc, q = 1 (max) probes deeper
+    others = set(order[1:, :ncap].flatten().tolist())
+    starved = torch.zeros(200, dtype=torch.bool)
+    starved[[c for c in order[0, :12].tolist() if c not in others]] = True
+    pc = torch.where(starved, 0.0, 10.0)
+    assert adaptive_probe(Q, C, nc, ncap, pc, tot, 0.10, q=0.75)[2] == nc
+    assert adaptive_probe(Q, C, nc, ncap, pc, tot, 0.10, q=1.0)[2] > nc
     print("  adaptive probing: uncorrelated / correlated filters keep nc, anti-correlated probes to the cap")
 
 
