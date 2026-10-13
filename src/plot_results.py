@@ -36,9 +36,12 @@ STYLE = {
     "weft_hash": {"color": "#2f4b7c", "marker": "P", "label": "WEFT, hash Stage 3"},
     "weft_adapt": {"color": "#665191", "marker": "X", "label": "WEFT, adaptive probing"},
     "weft_pairs": {"color": "#003f5c", "marker": "v", "label": "WEFT, 32-bit pair sort"},
+    "weft_oracle": {"color": "#d45087", "marker": "o", "label": "WEFT, filter-aware (oracle) probing"},
+    "weft_oracle_adapt": {"color": "#a05195", "marker": "D", "label": "WEFT, oracle + adaptive probing"},
 }
 ALL_ENGINES = ["plaid", "ptms", "ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf",
-               "weft_noimpute", "weft", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "weft_hash", "weft_adapt", "weft_pairs", "muvera"]
+               "weft_noimpute", "weft", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "weft_hash", "weft_adapt", "weft_pairs",
+               "weft_oracle", "weft_oracle_adapt", "muvera"]
 ENGINES = ALL_ENGINES          # narrowed in main() to the engines present in results.json
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 

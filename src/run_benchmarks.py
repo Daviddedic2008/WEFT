@@ -47,14 +47,17 @@ import torch
 
 import eval_config as C
 import eval_lib as E
-from engines import Engines, cfg_key, RAGRT_ENGINES, RESID_ENGINES, GRAPH_ENGINES, ADAPT_ENGINES
+from engines import Engines, cfg_key, RAGRT_ENGINES, RESID_ENGINES, GRAPH_ENGINES, ADAPT_ENGINES, ORACLE_ENGINES
+PERQ_PREP = ADAPT_ENGINES + ORACLE_ENGINES      # per-query prep state: no batched pipeline
 import rtrag_corr_3d
 
 CORE = ["plaid", "ptms", "ragrt"]          # the primary operating point must be reachable by these
 # ablations: no-RT Stage 1; codebook filter off; no codeword score; plain IVF on RAGRT kernels; MUVERA
 ENGINES = CORE + ["ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft_noimpute", "weft",
                   "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph",
-                  "weft_hash", "weft_adapt", "weft_pairs", "muvera"]
+                  "weft_hash", "weft_adapt", "weft_pairs", "weft_oracle", "weft_oracle_adapt", "muvera"]
+# engines identical to another when unfiltered: the filtered stage runs them at that engine's selected config
+PARAMS_FROM = {"weft_oracle": "weft", "weft_oracle_adapt": "weft_adapt"}
 # (slow, fast, what the step from slow to fast changes); ratio = latency(slow) / latency(fast)
 ATTRIBUTION = [
     ("ptms", "ragrt_ivf", "engine: PLAID candidate generation -> same algorithm on RAGRT kernels"),
@@ -377,6 +380,8 @@ class Bench:
         sel = self.R["selection"]
         s = sel[self.R["primary_target"]]
         out = {e: s[e]["params"] for e in engines if s.get(e)}
+        out.update({e: s[PARAMS_FROM[e]]["params"] for e in engines
+                    if e not in out and e in PARAMS_FROM and s.get(PARAMS_FROM[e])})
         fb = self.R.setdefault("primary_fallback", {})
         for e in engines:
             if e in out:
@@ -492,8 +497,8 @@ class Bench:
                 res = self.evaluate(engine, p, qids, filt=f)
                 out[f][engine] = self.summarize(res)
                 log = getattr(self.eng, "adapt_log", None)
-                if engine in ADAPT_ENGINES and log:
-                    out[f][engine]["adapt_nc_mean"] = float(np.mean(log))
+                if engine in PERQ_PREP and log:      # probed depth (unfiltered centroid rank), per query
+                    out[f][engine]["adapt_nc_mean"] = float(np.mean([float(x) for x in log]))
             row = "  ".join(f"{e} {out[f][e]['lat']['median']:.2f}ms r10={out[f][e]['gt_r10']['mean']:.3f}"
                             for e in out[f])
             print(f"    filter {f:<10} {row}", flush=True)
@@ -532,7 +537,7 @@ class Bench:
                 out[f"{engine}_sequential_qps"] = timed(
                     lambda batch, e=engine: [self.eng.search(e, Qf, n, P[e]) for Qf, n in batch])
         for e in RAGRT_ENGINES:
-            if e not in P or e in RESID_ENGINES or e in GRAPH_ENGINES or e in ADAPT_ENGINES:   # per-query state
+            if e not in P or e in RESID_ENGINES or e in GRAPH_ENGINES or e in PERQ_PREP:   # per-query state
                 continue
             self.eng.use_engine(e)
             pe = self.eng.resolve(e, P[e])

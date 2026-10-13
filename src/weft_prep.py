@@ -72,7 +72,7 @@ def imputed_passage_scores(best, found, m):
     return torch.where(found, best, m[None, :]).sum(1)
 
 
-def adaptive_probe(Q, C, nc, ncap, pass_c, tot_c, sel, q=1.0, slack=1.0):
+def adaptive_probe(Q, C, nc, ncap, pass_c, tot_c, sel, q=1.0, slack=1.0, empty=None, n_ok=None, stats=None):
     """Adaptive probing under a filter (engine weft_adapt). pass_c / tot_c [NC]: postings per centroid
     whose passage passes the filter / all postings; sel: global pass rate. For each query token the
     target is sel x (postings in its top-nc lists), the passing postings an uncorrelated filter would
@@ -83,8 +83,15 @@ def adaptive_probe(Q, C, nc, ncap, pass_c, tot_c, sel, q=1.0, slack=1.0):
     when at most a (1 - q) share of tokens is short, nc' = nc and no deeper top-k runs. slack < 1 keeps
     random filters (counts scatter around the target, so about half the tokens fall just below it) on
     the fast path; anti-correlated filters sit far below the target. The deeper probe uses the full target.
+    empty / n_ok (weft_oracle_adapt): bool [NC] centroids with no passing postings, and how many are not;
+    empty centroids are skipped (probing and imputation), as in oracle_prep. stats["depth"]: mean over
+    tokens of how far down the unfiltered centroid ranking the last probed centroid sits (GPU tensor).
     Returns (topc int32 [ntok, nc'], compact shifted scores float32 [ntok, nc'], nc')."""
-    s = Q @ C.T
+    s0 = s = Q @ C.T
+    if empty is not None:
+        s = s.masked_fill(empty, float("-inf"))
+        nc = min(nc, n_ok - 1)
+        ncap = min(ncap, n_ok - 1)
     vals, idx = s.topk(nc + 1, dim=-1)
     target = sel * tot_c[idx[:, :nc]].sum(1)
     short = (pass_c[idx[:, :nc]].sum(1) < slack * target).float().mean()
@@ -97,4 +104,23 @@ def adaptive_probe(Q, C, nc, ncap, pass_c, tot_c, sel, q=1.0, slack=1.0):
         nc2 = int(torch.quantile(need, q).ceil()) if q < 1.0 else int(need.max())
         nc2 = max(nc, min(ncap, nc2))
     m = vals[:, nc2].float()
+    if stats is not None:
+        stats["depth"] = (s0 >= vals[:, nc2 - 1:nc2]).sum(1).float().mean()
     return idx[:, :nc2].to(torch.int32).contiguous(), (vals[:, :nc2].float() - m[:, None]).contiguous(), nc2
+
+
+def oracle_prep(Q, C, nc, empty, n_ok):
+    """Filter-aware prep (engine weft_oracle): emulate an IVF over only the passages that pass the filter,
+    keeping the same centroids (the IVF analogue of ACORN's oracle partition index). A centroid whose list
+    holds no passing postings is absent from that index, so for each query token: probe the nc nearest
+    centroids that hold passing postings, and impute missing scores from the (nc+1)-th such centroid,
+    an upper bound on any passing posting outside the probed lists. empty: bool [NC]; n_ok: non-empty count.
+    Returns (topc int32 [ntok, nc'], compact shifted scores [ntok, nc'], depth): depth = mean over tokens of
+    the unfiltered rank of the last probed centroid (nc' + the empty centroids skipped before it)."""
+    s0 = Q @ C.T
+    s = s0.masked_fill(empty, float("-inf"))
+    nc = min(nc, n_ok - 1)
+    vals, idx = s.topk(nc + 1, dim=-1)
+    m = vals[:, nc].float()
+    depth = (s0 >= vals[:, nc - 1:nc]).sum(1).float().mean()
+    return idx[:, :nc].to(torch.int32).contiguous(), (vals[:, :nc].float() - m[:, None]).contiguous(), depth

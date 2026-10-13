@@ -2,6 +2,7 @@
 # WARP + XTR baseline on LoTTE pooled dev (CPU retrieval, GPU indexing), isolated from the RAGRT env.
 #   ./run_warp.sh [setup] [index] [search]        (default: all three)
 # setup : clone xtr-warp into $SCR/xtr-warp, venv $SCR/venvs/warp (inherits the system torch),
+#         pip deps (warp imports onnxruntime, openvino/optimum-intel, line_profiler, pytrec_eval at import time),
 #         pip deps, .env (INDEX_ROOT, EXPERIMENT_ROOT, LOTTE_COLLECTION_PATH)
 # index : google/xtr-base-en index of lotte/pooled/dev, nbits=2 (~1 to 3 h; needs ~30 GB scratch)
 # search: nprobe 8,16,32 x threads 1,16 -> $RAGRT_RESULTS/lotte/warp_lotte_pooled.json
@@ -21,7 +22,8 @@ for st in $STEPS; do
       [ -d "$REPO" ] || git clone -q https://github.com/jlscheerer/xtr-warp.git "$REPO"
       [ -d "$VENV" ] || python3 -m venv --system-site-packages "$VENV"
       "$VENV/bin/pip" install -q --no-cache-dir bitarray ujson python-dotenv jsonlines gitpython psutil ninja \
-          faiss-cpu beir scipy tqdm transformers sentencepiece
+          faiss-cpu beir scipy tqdm transformers sentencepiece \
+          onnxruntime openvino optimum optimum-intel line_profiler pytrec_eval pandas matplotlib datasets tabulate
       mkdir -p $SCR/warp_indexes $SCR/warp_experiments
       printf "INDEX_ROOT=%s\nEXPERIMENT_ROOT=%s\nBEIR_COLLECTION_PATH=%s\nLOTTE_COLLECTION_PATH=%s\n" \
           $SCR/warp_indexes $SCR/warp_experiments $SCR/beir "$LOTTE" > "$REPO/.env"

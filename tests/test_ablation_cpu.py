@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import ragrt_index_lib as L
 from build_plain_ivf import plain_ivf_csr
 import muvera_fde as M
-from weft_prep import native_prep, imputed_passage_scores, residual_lut, residual_dot_reference
+from weft_prep import native_prep, imputed_passage_scores, residual_lut, residual_dot_reference, oracle_prep
 
 
 def test_plain_ivf(max_len, seed=0):
@@ -214,6 +214,41 @@ def test_muvera_tracks_chamfer():
     assert corr[5] > corr[0] + 0.05 and corr[5] > 0.5, corr
 
 
+
+def test_oracle_prep():
+    """weft_oracle: skip centroids with no passing postings, impute from the next non-empty one."""
+    from weft_prep import adaptive_probe
+    g = torch.Generator().manual_seed(7)
+    C = torch.nn.functional.normalize(torch.randn(300, 128, generator=g), dim=-1)
+    Q = torch.nn.functional.normalize(torch.randn(5, 128, generator=g), dim=-1)
+    full = Q @ C.T
+    order = full.argsort(dim=-1, descending=True)
+    nc = 6
+    # no empty centroid: identical to native_prep with imputation
+    none = torch.zeros(300, dtype=torch.bool)
+    t, s, depth = oracle_prep(Q, C, nc, none, 300)
+    t0, s0, _ = native_prep(Q, C, nc, impute=True, compact=True)
+    assert torch.equal(t, t0) and torch.allclose(s, s0) and abs(float(depth) - nc) < 1e-6
+    # empty centroids among each token's nearest: probe the nearest non-empty ones, impute from the next
+    empty = torch.zeros(300, dtype=torch.bool)
+    empty[order[:, [0, 2, 3]].flatten()] = True
+    t, s, depth = oracle_prep(Q, C, nc, empty, int((~empty).sum()))
+    for i in range(5):
+        ok = [c for c in order[i].tolist() if not empty[c]]
+        assert t[i].tolist() == ok[:nc]
+        m = float(full[i, ok[nc]])
+        assert torch.allclose(s[i], full[i, ok[:nc]] - m, atol=1e-6) and (s[i] >= -1e-6).all()
+        # the oracle's imputed value is never above plain weft's (it skips empty lists)
+        assert m <= float(full[i, order[i, nc]]) + 1e-6
+    assert float(depth) > nc
+    # adaptive probing with the same skipping: on a filter it does not trigger, same as oracle_prep
+    pass_c = torch.where(empty, 0.0, 10.0)
+    st = {}
+    t2, s2, n2 = adaptive_probe(Q, C, nc, 4 * nc, pass_c, torch.full((300,), 10.0), 1.0,
+                                q=0.75, slack=0.5, empty=empty, n_ok=int((~empty).sum()), stats=st)
+    assert n2 == nc and torch.equal(t2, t) and torch.allclose(s2, s) and abs(float(st["depth"]) - float(depth)) < 1e-6
+    print("  oracle prep: skips centroids with no passing postings, imputes from the next non-empty one")
+
 def test_native_prep_and_imputation(seed=0):
     g = torch.Generator().manual_seed(seed)
     Q = torch.nn.functional.normalize(torch.randn(12, 128, generator=g), dim=-1)
@@ -254,4 +289,5 @@ if __name__ == "__main__":
     test_muvera_matches_reference()
     test_muvera_tracks_chamfer()
     test_native_prep_and_imputation()
+    test_oracle_prep()
     print("ABLATION CPU TESTS PASSED")
