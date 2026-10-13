@@ -5,7 +5,7 @@
 # Steps (default: build gpu_tests attribution phrt muvera fastplaid4):
 #   fastplaid2 build gpu_tests cpu_tests attribution phrt muvera fastplaid4 msmarco_check
 #   lotte_corr lotte_graph msmarco_encode msmarco_corr msmarco_graph lotte_tue msmarco_tue
-#   lotte_wed msmarco_wed warp_setup warp_index warp_search
+#   lotte_wed msmarco_wed lotte_thu msmarco_thu warp_setup warp_index warp_search
 # Progress: cat ~/overnight/STATUS
 set -u
 cd "$(dirname "$0")"
@@ -73,6 +73,8 @@ for st in $STEPS; do case "$st" in
   # Oct 13 night: pair-sort Stage 3, revised adaptive probing, WARP + XTR baseline (own venv)
   lotte_wed)      [ $BOK = 1 ] && step lotte_wed   "./run_attribution.sh lotte v3_ablation wed" ;;
   msmarco_wed)    [ $BOK = 1 ] && step msmarco_wed "./run_attribution.sh msmarco v1 wed" ;;
+  lotte_thu)      [ $BOK = 1 ] && step lotte_thu   "./run_attribution.sh lotte v3_ablation thu" ;;
+  msmarco_thu)    [ $BOK = 1 ] && step msmarco_thu "./run_attribution.sh msmarco v1 thu" ;;
   warp_setup)     step warp_setup  "./baselines/run_warp.sh setup" ;;
   warp_index)     step warp_index  "./baselines/run_warp.sh index" ;;
   warp_search)    step warp_search "./baselines/run_warp.sh search" ;;

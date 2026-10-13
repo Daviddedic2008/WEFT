@@ -171,6 +171,11 @@ def test_adaptive_probe():
     pc = torch.where(starved, 0.0, 10.0)
     assert adaptive_probe(Q, C, nc, ncap, pc, tot, 0.10, q=0.75)[2] == nc
     assert adaptive_probe(Q, C, nc, ncap, pc, tot, 0.10, q=1.0)[2] > nc
+    # random filter: every list a little under the expected count -> slack keeps the fast path
+    pr = torch.full((200,), 9.0)
+    assert adaptive_probe(Q, C, nc, ncap, pr, tot, 0.10, q=0.75)[2] > nc
+    assert adaptive_probe(Q, C, nc, ncap, pr, tot, 0.10, q=0.75, slack=0.5)[2] == nc
+    assert adaptive_probe(Q, C, nc, ncap, pass_c, tot, 0.10, slack=0.5)[2] == ncap
     print("  adaptive probing: uncorrelated / correlated filters keep nc, anti-correlated probes to the cap")
 
 

@@ -91,6 +91,7 @@ PAIRS_ENGINES = ("weft_pairs",)
 ADAPT_ENGINES = ("weft_adapt",)          # per-query nc: no batched pipeline
 ADAPT_CAP = 8                            # probe at most ADAPT_CAP x nc centroids
 ADAPT_Q = 0.75                           # quantile of the tokens' needed nc (1.0 = max)
+ADAPT_SLACK = 0.5                        # token is starved below this share of the uncorrelated count
 GRAPH_ENGINES = ("weft_graph",)          # CUDA-graph path: no per-stage profile, no batched pipeline
 RESID_ENGINES = ("weft_resid", "weft_resid_norr")       # need a token-level index (csr_token_ids.npy)
 TOKEN_ENGINES = ("weft_tok",) + RESID_ENGINES
@@ -424,7 +425,7 @@ class Engines:
             pass_c = self.pass_cache[mask] = self.cbc["bits"] @ bits      # [NC]
         ncap = min(ADAPT_CAP * nc, self.centroids_fp16.shape[0] - 1)
         topc, scores, nc2 = adaptive_probe(Q, self.centroids_fp16, nc, ncap, pass_c, self.cbc["tot"],
-                                           self.selectivity(mask), q=ADAPT_Q)
+                                           self.selectivity(mask), q=ADAPT_Q, slack=ADAPT_SLACK)
         self.last_adapt_nc = nc2
         self.adapt_log.append(nc2)
         return topc, scores

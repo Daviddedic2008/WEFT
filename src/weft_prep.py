@@ -72,19 +72,22 @@ def imputed_passage_scores(best, found, m):
     return torch.where(found, best, m[None, :]).sum(1)
 
 
-def adaptive_probe(Q, C, nc, ncap, pass_c, tot_c, sel, q=1.0):
+def adaptive_probe(Q, C, nc, ncap, pass_c, tot_c, sel, q=1.0, slack=1.0):
     """Adaptive probing under a filter (engine weft_adapt). pass_c / tot_c [NC]: postings per centroid
     whose passage passes the filter / all postings; sel: global pass rate. For each query token the
     target is sel x (postings in its top-nc lists), the passing postings an uncorrelated filter would
     leave; the token needs the smallest nc' in [nc, ncap] whose top-nc' lists hold that many passing
     postings. The query uses the q-quantile of the tokens' nc' (q = 1: the max; one k_cent per query),
     imputation at the (nc'+1)-th score.
-    Fast path: when at most a (1 - q) share of tokens is short at nc, nc' = nc and no deeper top-k runs.
+    Fast path: a token is short when its top-nc lists hold fewer than slack x target passing postings;
+    when at most a (1 - q) share of tokens is short, nc' = nc and no deeper top-k runs. slack < 1 keeps
+    random filters (counts scatter around the target, so about half the tokens fall just below it) on
+    the fast path; anti-correlated filters sit far below the target. The deeper probe uses the full target.
     Returns (topc int32 [ntok, nc'], compact shifted scores float32 [ntok, nc'], nc')."""
     s = Q @ C.T
     vals, idx = s.topk(nc + 1, dim=-1)
     target = sel * tot_c[idx[:, :nc]].sum(1)
-    short = (pass_c[idx[:, :nc]].sum(1) < target).float().mean()
+    short = (pass_c[idx[:, :nc]].sum(1) < slack * target).float().mean()
     if float(short) <= 1.0 - q + 1e-9:
         nc2 = nc
     else:

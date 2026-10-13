@@ -100,6 +100,16 @@ for st in $STEPS; do
           --core plaid,ptms,weft --engines weft,weft_pairs,weft_adapt \
           --stages sweep,select,test,breakdown,throughput,attribution,filtered
       python3 plot_results.py --dataset "$DATASET" --results_subdir "${BASE}_wed" ;;
+    thu)
+      [ -f "$IVF_DIR/csr_packed_24.npy" ] || { echo "run the ivf step first"; exit 1; }
+      PREV="$ROOT/$BASE"
+      for c in "$ROOT/${BASE}_weft" "$ROOT/${BASE}_resid" "$ROOT/${BASE}_graph" "$ROOT/${BASE}_tue" "$ROOT/${BASE}_wed"; do [ -f "$c/results.json" ] && PREV="$c"; done
+      python3 run_benchmarks.py --dataset "$DATASET" --results_subdir "${BASE}_thu" --sparse_csr_dir "$IVF_DIR" \
+          --baseline_from "$PREV" \
+          --import_engines plaid,ptms,ragrt,ragrt_bf,ragrt_nofilter,ragrt_centroid,ragrt_ivf,weft_noimpute,weft_tok,weft_resid,weft_resid_norr,weft_graph,weft_hash,weft_pairs \
+          --core plaid,ptms,weft --engines weft,weft_adapt \
+          --stages sweep,select,test,attribution,filtered
+      python3 plot_results.py --dataset "$DATASET" --results_subdir "${BASE}_thu" ;;
     encode)
       python3 bench_encode.py --dataset "$DATASET" --sparse_csr_dir "$IVF_DIR" ;;
     muvera)
