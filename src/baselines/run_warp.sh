@@ -25,6 +25,9 @@ for st in $STEPS; do
       "$VENV/bin/pip" install -q --no-cache-dir bitarray ujson python-dotenv jsonlines gitpython psutil ninja \
           faiss-cpu beir scipy tqdm transformers sentencepiece huggingface_hub \
           onnxruntime line_profiler pytrec-eval-terrier pandas matplotlib datasets tabulate
+      # the venv sees the system's apt matplotlib/pandas/scipy, built for numpy 1.x, while pip brought numpy 2.x:
+      # install wheels built for the venv's numpy into the venv itself
+      "$VENV/bin/pip" install -q --no-cache-dir --ignore-installed matplotlib pandas scipy
       # WARP imports its OpenVINO runtime at import time; we use the default torch runtime, so make it optional
       "$VENV/bin/python" - "$REPO/warp/engine/runtime/openvino_model.py" <<'PY'
 import sys
