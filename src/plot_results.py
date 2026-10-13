@@ -38,10 +38,12 @@ STYLE = {
     "weft_pairs": {"color": "#003f5c", "marker": "v", "label": "WEFT, 32-bit pair sort"},
     "weft_oracle": {"color": "#d45087", "marker": "o", "label": "WEFT, filter-aware (oracle) probing"},
     "weft_oracle_adapt": {"color": "#a05195", "marker": "D", "label": "WEFT, oracle + adaptive probing"},
+    "weft_oimp": {"color": "#f95d6a", "marker": "^", "label": "WEFT, filter-aware imputation only"},
+    "weft_oskip": {"color": "#ff7c43", "marker": "s", "label": "WEFT, skip empty centroids only"},
 }
 ALL_ENGINES = ["plaid", "ptms", "ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf",
                "weft_noimpute", "weft", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "weft_hash", "weft_adapt", "weft_pairs",
-               "weft_oracle", "weft_oracle_adapt", "muvera"]
+               "weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip", "muvera"]
 ENGINES = ALL_ENGINES          # narrowed in main() to the engines present in results.json
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 
@@ -304,6 +306,15 @@ def summary_md(R, out, metric_name):
             cell = lambda e: (f"{d[e]['gt_r10']['mean']:.3f} ({d[e]['lat']['median']:.2f} ms"
                               + (f", nc {d[e]['adapt_nc_mean']:.0f}" if "adapt_nc_mean" in d[e] else "") + ")") if e in d else ""
             L.append(f"| {f} | " + " | ".join(cell(e) for e in cols) + " |")
+    if R.get("filtered_pairs"):
+        P = R["filtered_pairs"]
+        cols = sorted({k for d in P.values() for k in d}, key=lambda k: list(next(iter(P.values()))).index(k)
+                      if k in next(iter(P.values())) else 99)
+        L += ["", "## Filtered search: paired recall@10 difference (b - a on the same queries, 95% bootstrap CI)", "",
+              "| filter | " + " | ".join(cols) + " |", "|---" * (len(cols) + 1) + "|"]
+        for f, d in P.items():
+            L.append(f"| {f} | " + " | ".join(f"{d[c]['mean']:+.4f} [{d[c]['ci95'][0]:+.4f}, {d[c]['ci95'][1]:+.4f}]"
+                                              if c in d else "" for c in cols) + " |")
     if "filter_budget" in R:
         L += ["", "## Post-filtering with larger candidate budgets (PLAID / PLAID+TMS)", "",
               "| filter | engine | budget (ncells, threshold, ndocs) | recall@10 | median ms |", "|---|---|---|---|---|"]

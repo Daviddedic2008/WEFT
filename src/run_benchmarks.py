@@ -55,9 +55,13 @@ CORE = ["plaid", "ptms", "ragrt"]          # the primary operating point must be
 # ablations: no-RT Stage 1; codebook filter off; no codeword score; plain IVF on RAGRT kernels; MUVERA
 ENGINES = CORE + ["ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft_noimpute", "weft",
                   "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph",
-                  "weft_hash", "weft_adapt", "weft_pairs", "weft_oracle", "weft_oracle_adapt", "muvera"]
+                  "weft_hash", "weft_adapt", "weft_pairs", "weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip", "muvera"]
 # engines identical to another when unfiltered: the filtered stage runs them at that engine's selected config
-PARAMS_FROM = {"weft_oracle": "weft", "weft_oracle_adapt": "weft_adapt"}
+PARAMS_FROM = {"weft_oracle": "weft", "weft_oracle_adapt": "weft_adapt", "weft_oimp": "weft", "weft_oskip": "weft"}
+# filtered stage: paired recall@10 differences (b - a, same queries) for these (a, b) when both ran in this run
+FILTER_PAIRS = [("weft", "weft_adapt"), ("weft", "weft_oracle"), ("weft_adapt", "weft_oracle_adapt"),
+                ("weft", "weft_oimp"), ("weft", "weft_oskip")]
+DIAG_QUERIES = 200        # untimed pass per filter that logs the probed depth of filter-aware engines
 # (slow, fast, what the step from slow to fast changes); ratio = latency(slow) / latency(fast)
 ATTRIBUTION = [
     ("ptms", "ragrt_ivf", "engine: PLAID candidate generation -> same algorithm on RAGRT kernels"),
@@ -490,15 +494,31 @@ class Bench:
         qids = self.test[:self.args.max_filter_queries]
         filts = [f for f in self.gt_names if f != "all" and (not self.args.filters or f in self.args.filters)]
         out = self.R.setdefault("filtered", {})
+        pairs = self.R.setdefault("filtered_pairs", {})
         for f in filts:
             out.setdefault(f, {})
+            r10 = {}
             for engine, p in P.items():
+                depth = None
+                if engine in ORACLE_ENGINES:         # untimed pass: how deep the last probed centroid sits
+                    self.eng.diag, self.eng.adapt_log = True, []
+                    self.evaluate(engine, p, qids[:DIAG_QUERIES], filt=f)
+                    self.eng.diag = False
+                    depth = float(np.mean([float(x) for x in self.eng.adapt_log])) if self.eng.adapt_log else None
                 self.eng.adapt_log = []
                 res = self.evaluate(engine, p, qids, filt=f)
                 out[f][engine] = self.summarize(res)
-                log = getattr(self.eng, "adapt_log", None)
-                if engine in PERQ_PREP and log:      # probed depth (unfiltered centroid rank), per query
+                r10[engine] = res["gt_r10"]
+                self.perq[f"{engine}|filt:{f}|gt_r10"] = res["gt_r10"]
+                log = self.eng.adapt_log
+                if depth is not None:                # probed depth (unfiltered centroid rank)
+                    out[f][engine]["adapt_nc_mean"] = depth
+                elif engine in ADAPT_ENGINES and log:
                     out[f][engine]["adapt_nc_mean"] = float(np.mean([float(x) for x in log]))
+            for a, b in FILTER_PAIRS:
+                if a in r10 and b in r10:
+                    m, lo, hi = E.paired_diff_ci(r10[b], r10[a])
+                    pairs.setdefault(f, {})[f"{a} -> {b}"] = {"mean": m, "ci95": [lo, hi]}
             row = "  ".join(f"{e} {out[f][e]['lat']['median']:.2f}ms r10={out[f][e]['gt_r10']['mean']:.3f}"
                             for e in out[f])
             print(f"    filter {f:<10} {row}", flush=True)

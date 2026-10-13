@@ -36,10 +36,13 @@ The three retrieval engines behind one interface, for benchmarks and profiling.
   weft_adapt : weft + adaptive probing under a filter: when the probed centroids' lists hold fewer
              passing postings than an uncorrelated filter would (per-centroid filter-bit counts,
              centroid_bit_counts.npy), probe up to ADAPT_CAP x nc centroids (anti-correlated filters).
-  weft_oracle : weft with filter-aware prep under a filter (weft_prep.oracle_prep): each query token
-             probes its nc nearest centroids that hold passing postings and imputes from the next such
-             centroid, emulating an IVF built over only the passing passages (cf. ACORN's oracle index).
-  weft_oracle_adapt : weft_adapt with the same skipping of empty centroids.
+  weft_oracle : weft with filter-aware prep under a filter (weft_prep.oracle_fast_prep): each query
+             token probes its nc nearest centroids that hold passing postings and imputes from the next
+             such centroid, emulating an IVF built over only the passing passages (cf. ACORN's oracle
+             index). The GEMM runs over the non-empty centroids only (compacted once per filter).
+  weft_oracle_adapt : weft_adapt over the same non-empty centroids.
+  weft_oimp / weft_oskip : ablations, the two halves of weft_oracle (weft_prep.oracle_ablation):
+             filter-aware imputation only / skipping empty centroids only.
   muvera   : MUVERA fixed-dimensional encodings (build_muvera_fde.py), exact GPU inner
              product over all passages, then the same TileMaxSim rerank. Grid: cands.
 
@@ -75,7 +78,8 @@ from colbert.search.strided_tensor import StridedTensor
 from colbert.modeling.colbert import colbert_score_reduce
 import rtrag_corr_3d
 import ragrt_index_lib as L
-from weft_prep import native_prep, residual_lut, residual_byte_weights, adaptive_probe, oracle_prep
+from weft_prep import (native_prep, residual_lut, residual_byte_weights, adaptive_probe, compact_centroids,
+                       oracle_fast_prep, oracle_ablation, unfiltered_depth)
 
 NEG_INF = float("-inf")
 
@@ -89,11 +93,12 @@ def ragrt_cfg_key(p):
 
 
 WEFT_ENGINES = ("weft", "weft_noimpute", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "weft_hash",
-                "weft_adapt", "weft_pairs", "weft_oracle", "weft_oracle_adapt")
+                "weft_adapt", "weft_pairs", "weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip")
 HASH_ENGINES = ("weft_hash",)
 PAIRS_ENGINES = ("weft_pairs",)
 ADAPT_ENGINES = ("weft_adapt", "weft_oracle_adapt")   # per-query nc: no batched pipeline
-ORACLE_ENGINES = ("weft_oracle", "weft_oracle_adapt")  # skip centroids with no passing postings
+ORACLE_ENGINES = ("weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip")   # filter-aware prep
+ORACLE_MODE = {"weft_oracle": "oracle", "weft_oracle_adapt": "oracle", "weft_oimp": "oimp", "weft_oskip": "oskip"}
 ADAPT_CAP = 8                            # probe at most ADAPT_CAP x nc centroids
 ADAPT_Q = 0.75                           # quantile of the tokens' needed nc (1.0 = max)
 ADAPT_SLACK = 0.5                        # token is starved below this share of the uncorrelated count
@@ -114,7 +119,8 @@ PREP = {"weft": ("native", True, True, False), "weft_noimpute": ("native", False
         "weft_resid_norr": ("native", True, True, True), "weft_graph": ("native", True, True, False),
         "weft_hash": ("native", True, True, False), "weft_adapt": ("native", True, True, False),
         "weft_pairs": ("native", True, True, False), "weft_oracle": ("native", True, True, False),
-        "weft_oracle_adapt": ("native", True, True, False)}
+        "weft_oracle_adapt": ("native", True, True, False), "weft_oimp": ("native", True, True, False),
+        "weft_oskip": ("native", True, True, False)}
 NO_PREP = ("svd96", False, False, False)
 
 
@@ -175,8 +181,9 @@ class Engines:
         self.adapt = False
         self.cur_mask = 0
         self.cbc = None                 # per-centroid filter-bit counts (weft_adapt)
-        self.oracle = False             # weft_oracle*: skip centroids with no passing postings
-        self.empty_cache = {}           # filter mask -> (bool [NC] empty centroids, non-empty count)
+        self.oracle = None              # ORACLE_MODE of the current engine (None: not filter-aware)
+        self.oracle_cache = {}          # filter mask -> empty centroids, compacted centroids (per mask, once)
+        self.diag = False               # log the unfiltered depth of the last probed centroid (extra GEMM)
         self.sel_cache = {}
         self.pass_cache = {}
         self.adapt_log = []
@@ -365,9 +372,13 @@ class Engines:
                 topc, scores = self.adaptive_prep(Qf[:ntok], nc, self.cur_mask)
                 return Q_sub, scores, topc
             if self.oracle and self.cur_mask:
-                empty, n_ok = self.empty_centroids(self.cur_mask)
-                topc, scores, depth = oracle_prep(Qf[:ntok], self.centroids_fp16, nc, empty, n_ok)
-                self.adapt_log.append(depth)        # read after the run (no sync here)
+                o = self.oracle_info(self.cur_mask)
+                if self.oracle == "oracle":
+                    topc, scores, last = oracle_fast_prep(Qf[:ntok], o["C_ok"], o["ids"], nc)
+                else:
+                    topc, scores, last = oracle_ablation(Qf[:ntok], self.centroids_fp16, nc, o["empty"], self.oracle)
+                if self.diag:
+                    self.adapt_log.append(unfiltered_depth(Qf[:ntok], self.centroids_fp16, last))
                 return Q_sub, scores, topc
             topc, scores, _ = native_prep(Qf[:ntok], self.centroids_fp16, nc, impute, compact)
             if resid:   # read by the next Stage 3 (a global in the extension; one query at a time)
@@ -429,16 +440,25 @@ class Engines:
         hold that many passing postings (per-centroid bit counts; exact for one-bit masks, an upper
         bound for several bits), then use the largest nc' over tokens. Imputation uses the
         (nc' + 1)-th score. Returns (topc [ntok, nc'] int32, compact shifted scores [ntok, nc'])."""
-        pass_c = self.pass_counts(mask)
-        ncap = min(ADAPT_CAP * nc, self.centroids_fp16.shape[0] - 1)
-        kw = {}
-        if self.oracle:
-            empty, n_ok = self.empty_centroids(mask)
-            kw = {"empty": empty, "n_ok": n_ok, "stats": {}}
-        topc, scores, nc2 = adaptive_probe(Q, self.centroids_fp16, nc, ncap, pass_c, self.cbc["tot"],
-                                           self.selectivity(mask), q=ADAPT_Q, slack=ADAPT_SLACK, **kw)
+        pass_c, tot_c, C = self.pass_counts(mask), self.cbc["tot"], self.centroids_fp16
+        ids = None
+        if self.oracle:                          # weft_oracle_adapt: the non-empty centroids only
+            o = self.oracle_info(mask)
+            C, ids = o["C_ok"], o["ids"]
+            if ids is not None:
+                pass_c, tot_c = o["pass_ok"], o["tot_ok"]
+        ncap = min(ADAPT_CAP * nc, C.shape[0] - 1)
+        st = {}
+        topc, scores, nc2 = adaptive_probe(Q, C, nc, ncap, pass_c, tot_c, self.selectivity(mask),
+                                           q=ADAPT_Q, slack=ADAPT_SLACK, stats=st)
+        if ids is not None:
+            topc = ids[topc.long()].to(torch.int32).contiguous()
         self.last_adapt_nc = nc2
-        self.adapt_log.append(kw["stats"]["depth"] if self.oracle else nc2)
+        if self.oracle:
+            if self.diag:
+                self.adapt_log.append(unfiltered_depth(Q, self.centroids_fp16, st["last"]))
+        else:
+            self.adapt_log.append(nc2)
         return topc, scores
 
     def pass_counts(self, mask):
@@ -453,12 +473,19 @@ class Engines:
             pass_c = self.pass_cache[mask] = self.cbc["bits"] @ bits
         return pass_c
 
-    def empty_centroids(self, mask):
-        """(bool [NC] centroids with no passing postings, number of non-empty centroids), per mask, once."""
-        if mask not in self.empty_cache:
-            empty = self.pass_counts(mask) == 0
-            self.empty_cache[mask] = (empty, int((~empty).sum()))
-        return self.empty_cache[mask]
+    def oracle_info(self, mask):
+        """Per filter mask, once: empty centroids (no passing postings; exact, since bit counts only
+        over-count for several bits) and the compacted non-empty centroids with their counts."""
+        o = self.oracle_cache.get(mask)
+        if o is None:
+            pass_c = self.pass_counts(mask)
+            empty = pass_c == 0
+            C_ok, ids = compact_centroids(self.centroids_fp16, empty)
+            o = {"empty": empty, "C_ok": C_ok, "ids": ids,
+                 "pass_ok": pass_c if ids is None else pass_c[ids].contiguous(),
+                 "tot_ok": self.cbc["tot"] if ids is None else self.cbc["tot"][ids].contiguous()}
+            self.oracle_cache[mask] = o
+        return o
 
     @torch.no_grad()
     def ragrt_candidates(self, Qf, ntok, p, mask=0):
@@ -479,7 +506,7 @@ class Engines:
         rtrag_corr_3d.set_compact_scores(self.prep_mode[2])
         rtrag_corr_3d.set_stage3_mode(2 if engine in PAIRS_ENGINES else (1 if engine in HASH_ENGINES else 0))
         self.adapt = engine in ADAPT_ENGINES
-        self.oracle = engine in ORACLE_ENGINES
+        self.oracle = ORACLE_MODE.get(engine)
         if not self.prep_mode[3]:
             self.index.set_residual_lut(torch.empty(0))
 

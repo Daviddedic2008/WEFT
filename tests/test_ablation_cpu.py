@@ -241,13 +241,33 @@ def test_oracle_prep():
         # the oracle's imputed value is never above plain weft's (it skips empty lists)
         assert m <= float(full[i, order[i, nc]]) + 1e-6
     assert float(depth) > nc
-    # adaptive probing with the same skipping: on a filter it does not trigger, same as oracle_prep
+    # compacted fast path (weft_oracle) == the masked reference
+    from weft_prep import compact_centroids, oracle_fast_prep, oracle_ablation, unfiltered_depth
+    C_ok, ids = compact_centroids(C, empty)
+    tf, sf, last = oracle_fast_prep(Q, C_ok, ids, nc)
+    assert torch.equal(tf, t) and torch.allclose(sf, s, atol=1e-6)
+    assert abs(float(unfiltered_depth(Q, C, last)) - float(depth)) < 1e-6
+    assert compact_centroids(C, none)[1] is None             # random filters: no copy, no remap
+    # weft_oracle_adapt: adaptive probing over the compacted centroids, mapped back
     pass_c = torch.where(empty, 0.0, 10.0)
     st = {}
-    t2, s2, n2 = adaptive_probe(Q, C, nc, 4 * nc, pass_c, torch.full((300,), 10.0), 1.0,
-                                q=0.75, slack=0.5, empty=empty, n_ok=int((~empty).sum()), stats=st)
-    assert n2 == nc and torch.equal(t2, t) and torch.allclose(s2, s) and abs(float(st["depth"]) - float(depth)) < 1e-6
-    print("  oracle prep: skips centroids with no passing postings, imputes from the next non-empty one")
+    t2, s2, n2 = adaptive_probe(Q, C_ok, nc, 4 * nc, pass_c[ids], torch.full((len(ids),), 10.0), 1.0,
+                                q=0.75, slack=0.5, stats=st)
+    assert n2 == nc and torch.equal(ids[t2.long()].int(), t) and torch.allclose(s2, s)
+    # ablation halves: "oimp" probes like weft and imputes from the next non-empty centroid below them;
+    # "oskip" probes like weft_oracle and imputes from the very next centroid, empty or not
+    ti, si, _ = oracle_ablation(Q, C, nc, empty, "oimp")
+    tk, sk, _ = oracle_ablation(Q, C, nc, empty, "oskip")
+    for i in range(5):
+        o = order[i].tolist()
+        ok = [c for c in o if not empty[c]]
+        mi = float(full[i, next(c for c in o[nc:] if not empty[c])])
+        assert ti[i].tolist() == o[:nc] and torch.allclose(si[i], full[i, o[:nc]] - mi, atol=1e-6)
+        last_pos = o.index(ok[nc - 1])
+        mk = float(full[i, o[last_pos + 1]])
+        assert tk[i].tolist() == ok[:nc] and torch.allclose(sk[i], full[i, ok[:nc]] - mk, atol=1e-6)
+        assert (si[i] >= -1e-6).all() and (sk[i] >= -1e-6).all()
+    print("  oracle prep: skips empty centroids, imputes from the next non-empty one; compacted path and ablations agree")
 
 def test_native_prep_and_imputation(seed=0):
     g = torch.Generator().manual_seed(seed)

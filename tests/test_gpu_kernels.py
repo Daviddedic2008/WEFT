@@ -515,6 +515,29 @@ def test_hash_stage3(N=3000, NC=40, E=4, seed=11):
           f"(dedup + token-level/residual, with/without filter)")
 
 
+def test_oracle_prep_gpu(NC=4096, seed=13):
+    """weft_oracle on the GPU in fp16: the compacted path matches the masked reference."""
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    from weft_prep import oracle_prep, compact_centroids, oracle_fast_prep, oracle_ablation, unfiltered_depth
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    C = torch.nn.functional.normalize(torch.randn(NC, 128, device="cuda", generator=g), dim=-1).half()
+    Q = torch.nn.functional.normalize(torch.randn(32, 128, device="cuda", generator=g), dim=-1).half()
+    empty = torch.rand(NC, device="cuda", generator=g) < 0.6
+    n_ok = int((~empty).sum())
+    t, s, depth = oracle_prep(Q, C, 32, empty, n_ok)
+    C_ok, ids = compact_centroids(C, empty)
+    tf, sf, last = oracle_fast_prep(Q, C_ok, ids, 32)
+    same = (tf == t).float().mean().item()
+    assert same > 0.999, same                               # fp16 ties may swap a rare pair
+    assert torch.isfinite(sf).all() and (sf >= -1e-3).all()
+    assert abs(float(unfiltered_depth(Q, C, last)) - float(depth)) < 0.5
+    for mode in ("oimp", "oskip"):
+        ta, sa, _ = oracle_ablation(Q, C, 32, empty, mode)
+        assert torch.isfinite(sa).all() and (sa >= -1e-3).all(), mode
+    print(f"  oracle prep (GPU fp16): compacted == masked ({same:.4f} of topc), depth {float(depth):.1f}")
+
+
 if __name__ == "__main__":
     for E in (256, 1024, 4096):
         test_stage1(E)
@@ -525,4 +548,5 @@ if __name__ == "__main__":
     test_residual_scoring()
     test_graph_path()
     test_hash_stage3()
+    test_oracle_prep_gpu()
     print("ALL GPU KERNEL TESTS PASSED")

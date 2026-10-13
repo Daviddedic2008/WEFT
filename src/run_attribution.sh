@@ -119,6 +119,15 @@ for st in $STEPS; do
           --core plaid,ptms,weft --engines weft_oracle,weft_oracle_adapt --filtered_extra weft,weft_adapt \
           --stages select,filtered
       python3 plot_results.py --dataset "$DATASET" --results_subdir "${BASE}_oracle" ;;
+    oracle2)
+      [ -f "$IVF_DIR/csr_packed_24.npy" ] || { echo "run the ivf step first"; exit 1; }
+      PREV="$ROOT/${BASE}_thu"; [ -f "$PREV/results.json" ] || { echo "run the thu step first"; exit 1; }
+      python3 run_benchmarks.py --dataset "$DATASET" --results_subdir "${BASE}_oracle2" --sparse_csr_dir "$IVF_DIR" \
+          --baseline_from "$PREV" \
+          --import_engines plaid,ptms,ragrt,ragrt_bf,ragrt_nofilter,ragrt_centroid,ragrt_ivf,weft_noimpute,weft,weft_tok,weft_resid,weft_resid_norr,weft_graph,weft_hash,weft_pairs,weft_adapt \
+          --core plaid,ptms,weft --engines weft_oracle,weft_oracle_adapt,weft_oimp,weft_oskip --filtered_extra weft,weft_adapt \
+          --stages select,filtered
+      python3 plot_results.py --dataset "$DATASET" --results_subdir "${BASE}_oracle2" ;;
     encode)
       python3 bench_encode.py --dataset "$DATASET" --sparse_csr_dir "$IVF_DIR" ;;
     muvera)

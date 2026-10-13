@@ -33,7 +33,7 @@ DOCS = torch.tensor(RNG.normal(size=(N_DOCS, DIM)), dtype=torch.float32)
 
 FAKE_RESID = ("weft_resid", "weft_resid_norr")
 FAKE_RAGRT = ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft", "weft_noimpute",
-              "weft_tok", "weft_graph", "weft_hash", "weft_adapt", "weft_pairs", "weft_oracle", "weft_oracle_adapt") + FAKE_RESID
+              "weft_tok", "weft_graph", "weft_hash", "weft_adapt", "weft_pairs", "weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip") + FAKE_RESID
 
 
 def cfg_key(engine, p):
@@ -128,7 +128,7 @@ eng_mod.Engines, eng_mod.cfg_key, eng_mod.RAGRT_ENGINES = FakeEngines, cfg_key, 
 eng_mod.RESID_ENGINES = FAKE_RESID
 eng_mod.GRAPH_ENGINES = ("weft_graph",)
 eng_mod.ADAPT_ENGINES = ("weft_adapt", "weft_oracle_adapt")
-eng_mod.ORACLE_ENGINES = ("weft_oracle", "weft_oracle_adapt")
+eng_mod.ORACLE_ENGINES = ("weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip")
 sys.modules["engines"] = eng_mod
 
 import eval_config as C
@@ -299,7 +299,7 @@ def main():
     # configs (PARAMS_FROM), next to re-run weft / weft_adapt (--filtered_extra)
     sys.argv = ["run_benchmarks.py", "--dataset", "msmarco", "--quick", "--tune_size", "60", "--results_subdir", "oracle",
                 "--baseline_from", os.path.join(src, "tue"), "--import_engines", "plaid,ptms,weft,weft_graph,weft_hash,weft_adapt",
-                "--core", "plaid,ptms,weft", "--engines", "weft_oracle,weft_oracle_adapt", "--filtered_extra", "weft,weft_adapt",
+                "--core", "plaid,ptms,weft", "--engines", "weft_oracle,weft_oracle_adapt,weft_oimp,weft_oskip", "--filtered_extra", "weft,weft_adapt",
                 "--filters", "corr_near,corr_far", "--stages", "select,filtered", "--repeats", "1",
                 "--max_filter_queries", "40", "--targets", "0.5,0.9"]
     run_benchmarks.main()
@@ -307,7 +307,10 @@ def main():
     assert {"weft", "weft_adapt", "weft_oracle", "weft_oracle_adapt"} <= set(R7["filtered"]["corr_far"]), R7["filtered"]["corr_far"].keys()
     sys.argv = ["plot_results.py", "--dataset", "msmarco", "--results_subdir", "oracle"]
     plot_results.main()
-    assert "weft_oracle" in open(os.path.join(src, "oracle", "summary.md")).read()
+    md7 = open(os.path.join(src, "oracle", "summary.md")).read()
+    assert "weft_oskip" in md7 and "paired recall@10 difference" in md7
+    assert set(R7["filtered_pairs"]["corr_far"]) == {"weft -> weft_adapt", "weft -> weft_oracle", "weft_adapt -> weft_oracle_adapt",
+                                                    "weft -> weft_oimp", "weft -> weft_oskip"}
 
     sys.argv = ["plot_results.py", "--dataset", "msmarco"]
     plot_results.main()
