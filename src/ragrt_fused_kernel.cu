@@ -429,6 +429,112 @@ __global__ void sparse_fixup_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage 3, hash (no sort). Table 1: open addressing over 64-bit slots
+// [key + 1 (48 bits) | fp16 score bits (16)], key = pid * 32 + token: keeps the max score per
+// (passage, token). Table 2: pid + 1 -> float sum of those maxima. Failing (filtered) postings
+// never enter the tables. Both tables fit in L2 at the sizes WEFT uses (a few MB to ~30 MB).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ unsigned long long hash_slot(unsigned long long key, int log2cap) {
+    return (key * 0x9E3779B97F4A7C15ULL) >> (64 - log2cap);
+}
+
+__global__ void hash_insert_kernel(
+    const int* __restrict__ d_num_tasks,
+    const int* __restrict__ d_task_qt, const int64_t* __restrict__ d_task_offset,
+    const int* __restrict__ d_task_length, const float* __restrict__ d_task_base_score,
+    const uint8_t* __restrict__ map_packed_24, int num_passages,
+    const uint32_t* __restrict__ doc_predicates, uint32_t query_mask,
+    unsigned long long* __restrict__ table, int log2cap,
+    const uint32_t* __restrict__ tok_ids, const uint8_t* __restrict__ residuals, const float* __restrict__ lut
+) {
+    int total_tasks = *d_num_tasks;
+    if (total_tasks > MAX_TASKS) total_tasks = MAX_TASKS;
+    int lane = threadIdx.x % 32;
+    int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int nwarps = (gridDim.x * blockDim.x) / 32;
+    unsigned long long cmask = (1ULL << log2cap) - 1ULL;
+    for (int t = warp; t < total_tasks; t += nwarps) {
+        int qt = d_task_qt[t];
+        int64_t off = d_task_offset[t];
+        int len = d_task_length[t];
+        float base = d_task_base_score[t];
+        unsigned long long sbits = (unsigned long long)(__half_as_ushort(__float2half(base)) & 0x7FFF);
+        const float* L = lut ? lut + (size_t)qt * 32 * 256 : nullptr;
+        for (int i = lane; i < len; i += 32) {
+            const uint8_t* p24 = map_packed_24 + (off + i) * 3;
+            int pid = p24[0] | (p24[1] << 8) | (p24[2] << 16);
+            if (pid >= num_passages || (query_mask != 0 && (doc_predicates[pid] & query_mask) == 0)) continue;
+            unsigned long long sb = sbits;
+            if (L) {
+                const uint4* r4 = reinterpret_cast<const uint4*>(residuals + (size_t)tok_ids[off + i] * 32);
+                uint4 a = r4[0], b2 = r4[1];
+                const uint8_t* rb = reinterpret_cast<const uint8_t*>(&a);
+                const uint8_t* rc = reinterpret_cast<const uint8_t*>(&b2);
+                float sc = base;
+                #pragma unroll
+                for (int j = 0; j < 16; ++j) sc += L[j * 256 + rb[j]];
+                #pragma unroll
+                for (int j = 0; j < 16; ++j) sc += L[(16 + j) * 256 + rc[j]];
+                sb = (unsigned long long)(__half_as_ushort(__float2half(fmaxf(sc, 0.0f))) & 0x7FFF);
+            }
+            unsigned long long key = ((unsigned long long)pid << 5) | (unsigned long long)qt;
+            unsigned long long tag = (key + 1ULL) << 16;
+            unsigned long long h = hash_slot(key, log2cap);
+            while (true) {
+                unsigned long long old = table[h];
+                if (old == 0ULL) {
+                    old = atomicCAS(&table[h], 0ULL, tag | sb);
+                    if (old == 0ULL) break;
+                }
+                if ((old & ~0xFFFFULL) == tag) {
+                    while ((old & 0xFFFFULL) < sb) {
+                        unsigned long long seen = atomicCAS(&table[h], old, tag | sb);
+                        if (seen == old) break;
+                        old = seen;
+                    }
+                    break;
+                }
+                h = (h + 1) & cmask;
+            }
+        }
+    }
+}
+
+__global__ void hash_reduce_kernel(
+    const unsigned long long* __restrict__ table, long long cap, int log2cap,
+    int* __restrict__ pid_keys, float* __restrict__ pid_sums
+) {
+    unsigned long long cmask = (1ULL << log2cap) - 1ULL;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < cap; i += (long long)gridDim.x * blockDim.x) {
+        unsigned long long s = table[i];
+        if (s == 0ULL) continue;
+        unsigned long long key = (s >> 16) - 1ULL;
+        int pid = (int)(key >> 5);
+        float v = __half2float(__ushort_as_half((unsigned short)(s & 0x7FFFULL)));
+        unsigned long long h = hash_slot((unsigned long long)pid, log2cap);
+        while (true) {
+            int old = pid_keys[h];
+            if (old == 0) old = atomicCAS(&pid_keys[h], 0, pid + 1);
+            if (old == 0 || old == pid + 1) { atomicAdd(&pid_sums[h], v); break; }
+            h = (h + 1) & cmask;
+        }
+    }
+}
+
+__global__ void hash_compact_kernel(
+    const int* __restrict__ pid_keys, const float* __restrict__ pid_sums, long long cap,
+    int* __restrict__ d_count, int* __restrict__ pids_out, float* __restrict__ sums_out
+) {
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < cap; i += (long long)gridDim.x * blockDim.x) {
+        int k = pid_keys[i];
+        if (k == 0) continue;
+        int j = atomicAdd(d_count, 1);
+        pids_out[j] = k - 1;
+        sums_out[j] = pid_sums[i];
+    }
+}
+
 struct SumOp {
     __device__ __forceinline__ float operator()(const float& a, const float& b) const { return a + b; }
 };
@@ -671,6 +777,11 @@ static float g_cw_weight = 1.0f;
 extern "C" void ragrt_set_codeword_weight(float w) { g_cw_weight = w; }
 extern "C" float ragrt_get_codeword_weight() { return g_cw_weight; }
 
+// Stage 3 implementation for ragrt_stage3_sparse: 0 = radix sort (default), 1 = hash tables.
+static int g_stage3_hash = 0;
+extern "C" void ragrt_set_stage3_hash(int on) { g_stage3_hash = on ? 1 : 0; }
+extern "C" int ragrt_get_stage3_hash() { return g_stage3_hash; }
+
 // Compact centroid scores: Stage 2 reads scores[qt * k_cent + c] (only the probed centroids' scores,
 // aligned with topc) instead of the full [ntok, num_centroids] matrix. Saves building that matrix.
 static int g_compact_scores = 0;
@@ -846,6 +957,37 @@ extern "C" long long ragrt_stage3_sparse(
     cudaMemcpyAsync(B.h_total, B.total_postings, sizeof(unsigned long long), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
     long long P = (long long)(*B.h_total);
+    if (g_stage3_hash) {
+        // tables of 2^k >= 2P slots (load <= 0.5); table 1 in keys_a (8 B/slot), table 2 in run_pid_in / val_in
+        int log2cap = 16;
+        while ((1LL << log2cap) < 2 * P) ++log2cap;
+        long long cap = 1LL << log2cap;
+        ensure_sparse(buf_idx, (cap > min_len ? cap : min_len) + 1, stream);
+        cudaMemsetAsync(B.keys_a, 0, cap * sizeof(unsigned long long), stream);
+        cudaMemsetAsync(B.run_pid_in, 0, cap * sizeof(int), stream);
+        cudaMemsetAsync(B.val_in, 0, cap * sizeof(float), stream);
+        cudaMemsetAsync(B.num_runs, 0, sizeof(int), stream);
+        int threads = 256;
+        if (P > 0) {
+            hash_insert_kernel<<<1024, threads, 0, stream>>>(
+                B.num_tasks, B.task_qt, B.task_offset, B.task_length, B.task_base,
+                d_map_packed_24, num_passages, d_doc_predicates, query_mask, B.keys_a, log2cap,
+                g_tok_ids, g_res, (g_tok_ids && g_res) ? g_res_lut : nullptr);
+            unsigned nb = (unsigned)((cap + threads - 1) / threads); if (nb > 4096) nb = 4096;
+            hash_reduce_kernel<<<nb, threads, 0, stream>>>(B.keys_a, cap, log2cap, B.run_pid_in, B.val_in);
+            hash_compact_kernel<<<nb, threads, 0, stream>>>(B.run_pid_in, B.val_in, cap, B.num_runs, B.run_pid_out, B.sums);
+        }
+        cudaMemcpyAsync(B.h_total, B.num_runs, sizeof(int), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        long long U = *reinterpret_cast<int*>(B.h_total);
+        long long L = U > min_len ? U : min_len;
+        sparse_fixup_kernel<<<(unsigned)((L + threads - 1) / threads), threads, 0, stream>>>(
+            B.num_runs, L, num_passages, B.run_pid_out, B.sums);
+        *d_pids = B.run_pid_out;
+        *d_sums = B.sums;
+        *n_valid = U;
+        return L;
+    }
     ensure_sparse(buf_idx, (P > min_len ? P : min_len) + 1, stream);
 
     int pid_bits = 1;

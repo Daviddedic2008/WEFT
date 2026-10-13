@@ -4,7 +4,7 @@
 #   tmux new -s night;  ~/RTRAG/src/overnight.sh [step ...]
 # Steps (default: build gpu_tests attribution phrt muvera fastplaid4):
 #   fastplaid2 build gpu_tests cpu_tests attribution phrt muvera fastplaid4 msmarco_check
-#   lotte_corr lotte_graph msmarco_encode msmarco_corr msmarco_graph
+#   lotte_corr lotte_graph msmarco_encode msmarco_corr msmarco_graph lotte_tue msmarco_tue
 # Progress: cat ~/overnight/STATUS
 set -u
 cd "$(dirname "$0")"
@@ -28,14 +28,14 @@ step() {   # step <name> <command...>
 }
 free_gb() { df -BG --output=avail /local/scratch/a | tail -1 | tr -dc 0-9; }
 echo "== $(date)  git $(git rev-parse --short HEAD)  steps: $STEPS" >> "$STATUS"
-OK=1
+OK=1; BOK=1   # OK: build + GPU tests passed; BOK: build passed
 for st in $STEPS; do case "$st" in
   fastplaid2)
     step fastplaid2 "$FP_PY bench_fastplaid.py --dataset lotte --emb_dir $SCR/lotte_doc_embs \
       --index_dir $SCR/fastplaid_lotte_nbits2 --nbits 2 --compare v3_ablation --stages test,filtered,throughput" ;;
   build)   # torch must be imported first: it loads libc10 for the extension
     step build "python3 setup_corr_3d.py build_ext --inplace > /dev/null && \
-      python3 -c 'import torch, rtrag_corr_3d as X; X.set_codeword_weight(1.0); print(\"extension ok\", X.__file__)'" || OK=0 ;;
+      python3 -c 'import torch, rtrag_corr_3d as X; X.set_codeword_weight(1.0); print(\"extension ok\", X.__file__)'" || { OK=0; BOK=0; } ;;
   gpu_tests)
     [ $OK = 1 ] && { step gpu_tests "cd .. && python3 tests/test_gpu_kernels.py" || OK=0; } ;;
   cpu_tests)
@@ -66,6 +66,9 @@ for st in $STEPS; do case "$st" in
   msmarco_encode) step msmarco_encode "./run_attribution.sh msmarco v1 encode" ;;
   msmarco_corr)   step msmarco_corr   "./run_attribution.sh msmarco v1 corr" ;;
   msmarco_graph)  [ $OK = 1 ] && step msmarco_graph "./run_attribution.sh msmarco v1 graph" ;;
+  # Oct 13 queue: hash Stage 3, adaptive probing, post-filter budget sweep
+  lotte_tue)      [ $BOK = 1 ] && step lotte_tue   "./run_attribution.sh lotte v3_ablation tue" ;;
+  msmarco_tue)    [ $BOK = 1 ] && step msmarco_tue "./run_attribution.sh msmarco v1 tue" ;;
   *) echo "unknown step $st" | tee -a "$STATUS" ;;
 esac; done
 echo "== finished $(date)" | tee -a "$STATUS"

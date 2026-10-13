@@ -33,9 +33,11 @@ STYLE = {
     "weft_resid": {"color": "#bc5090", "marker": ">", "label": "WEFT + residual correction"},
     "weft_resid_norr": {"color": "#ef5675", "marker": "d", "label": "WARP-style (residuals, no rerank)"},
     "weft_graph": {"color": "#000060", "marker": "*", "label": "WEFT, CUDA graphs"},
+    "weft_hash": {"color": "#2f4b7c", "marker": "P", "label": "WEFT, hash Stage 3"},
+    "weft_adapt": {"color": "#665191", "marker": "X", "label": "WEFT, adaptive probing"},
 }
 ALL_ENGINES = ["plaid", "ptms", "ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf",
-               "weft_noimpute", "weft", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "muvera"]
+               "weft_noimpute", "weft", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "weft_hash", "weft_adapt", "muvera"]
 ENGINES = ALL_ENGINES          # narrowed in main() to the engines present in results.json
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 
@@ -124,7 +126,8 @@ def fig_breakdown(R, out):
                         ("ragrt_ivf", "plain IVF, RAGRT kernels", "1 all"),
                         ("weft_noimpute", "WEFT, no imputation", "1 all"), ("weft", "WEFT", "1 all"),
                         ("weft_tok", "WEFT token index", "1 all"), ("weft_resid", "WEFT + residuals", "1 all"),
-                        ("weft_resid_norr", "WARP-style, no rerank", "1 all")):
+                        ("weft_resid_norr", "WARP-style, no rerank", "1 all"), ("weft_hash", "WEFT, hash Stage 3", "1 all"),
+                        ("weft_adapt", "WEFT, adaptive", "1 all")):
         if e in b:
             r = b[e]
             bars.append((name, [("0b prep", r["s0b_prep"]), (s1, r["s1_rt"]), ("2 gather", r["s2_gather"]),
@@ -288,6 +291,22 @@ def summary_md(R, out, metric_name):
                 f = lambda k: f"{a[k]['mean']:+.4f} [{a[k]['ci95'][0]:+.4f}, {a[k]['ci95'][1]:+.4f}]" if k in a else "n/a"
                 L.append(f"| {name} | {a['what']} | {a['slow']} -> {a['fast']} | {a['latency_ratio']:.2f}x | "
                          f"{f('gt_r10_diff')} | {f('official_diff')} |")
+    if "filtered" in R:
+        L += ["", "## Filtered search (recall@10 vs the exact filtered top-10, median latency)", "",
+              "| filter | " + " | ".join(e for e in ALL_ENGINES if any(e in d for d in R["filtered"].values())) + " |"]
+        cols = [e for e in ALL_ENGINES if any(e in d for d in R["filtered"].values())]
+        L.append("|---" * (len(cols) + 1) + "|")
+        for f, d in R["filtered"].items():
+            cell = lambda e: (f"{d[e]['gt_r10']['mean']:.3f} ({d[e]['lat']['median']:.2f} ms"
+                              + (f", nc {d[e]['adapt_nc_mean']:.0f}" if "adapt_nc_mean" in d[e] else "") + ")") if e in d else ""
+            L.append(f"| {f} | " + " | ".join(cell(e) for e in cols) + " |")
+    if "filter_budget" in R:
+        L += ["", "## Post-filtering with larger candidate budgets (PLAID / PLAID+TMS)", "",
+              "| filter | engine | budget (ncells, threshold, ndocs) | recall@10 | median ms |", "|---|---|---|---|---|"]
+        for f, d in R["filter_budget"].items():
+            for e, rows in d.items():
+                for k, v in rows.items():
+                    L.append(f"| {f} | {e} | {k} | {v['gt_r10']['mean']:.3f} | {v['lat']['median']:.2f} |")
     if "attribution" in R:
         L += ["", "## Where the time goes (torch.profiler, primary point, per query)", "",
               "| engine | wall ms | GPU-busy ms | host/idle ms | kernels | memcpy/memset | host syncs |",

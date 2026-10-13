@@ -14,6 +14,8 @@ GPU tests (run on the server after building the extension and the PTX):
    compact scores == full scores; LUT off == centroid-only scores.
 6. CUDA-graph path (graph_search.py, engine weft_graph) returns the same results as the eager
    WEFT path, with and without a filter, across graph re-use and capacity buckets.
+7. Hash-table Stage 3 (weft_hash) == radix-sort Stage 3: same touched passages, same scores
+   (up to float summation order), with and without a filter, with and without residual scoring.
 """
 import os, sys
 import numpy as np
@@ -455,6 +457,61 @@ def test_graph_path(N=2500, NC=40, E=4, seed=7):
           f"(ndocs 256); graphs captured A={gs.stats['captures_a']} B={gs.stats['captures_b']}, replays {gs.stats['replays']}")
 
 
+def test_hash_stage3(N=3000, NC=40, E=4, seed=11):
+    rng = np.random.default_rng(seed)
+    doclens = rng.integers(4, 30, N)
+    T = int(doclens.sum())
+    codes = rng.integers(0, NC, T)
+    pids = np.repeat(np.arange(N), doclens)
+    pred = rng.integers(0, 4, N).astype(np.int64)
+    t = lambda a: torch.from_numpy(a).to(dev)
+    C128 = torch.nn.functional.normalize(torch.randn(NC, 128), dim=-1).half().to(dev)
+    bw = torch.tensor([-0.03, -0.01, 0.01, 0.03]).half().to(dev)
+    rbm = t(rng.permutation(256).astype(np.uint8))
+    dt = t(np.array([[(v >> 6) & 3, (v >> 4) & 3, (v >> 2) & 3, v & 3] for v in range(256)], dtype=np.uint8))
+    doc_off = torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(torch.from_numpy(doclens), 0)]).to(dev)
+    residuals = t(rng.integers(0, 256, (T, 32)).astype(np.uint8))
+    g = torch.Generator(device=dev).manual_seed(seed)
+    checked = 0
+    for tokens in (False, True):                     # plain IVF (dedup) and token-level (residuals)
+        csr = plain_ivf_csr(codes, pids, NC, tokens=tokens)
+        lengths = csr["lengths"].astype(np.uint16)
+        idx = X.CorrIndex3D(C.PTX_PATH)
+        idx.build((torch.randn(S, E, 3, device=dev, generator=g) * 0.1).cpu().contiguous(), 0.95, 4)
+        idx.set_geometry(0)
+        idx.bind_index(t(csr["row_ptrs"]), t(csr["col_eids"].astype(L.eid_dtype(E))), t(L.block_sums(lengths)), t(lengths),
+                       t(L.pack_pids_24(csr["pids_sorted"])), doc_off, t(doclens.astype(np.int32)), t(codes.astype(np.int32)),
+                       residuals, C128, bw, rbm, dt, t(pred).to(torch.uint32), N, NC)
+        if tokens:
+            idx.bind_token_ids(t(csr["token_ids"].view(np.int32)))
+        idx.set_stage3_sparse(True)
+        try:
+            X.set_codeword_weight(0.0); X.set_compact_scores(True); idx.set_stage1_mode(2)
+            for trial in range(4):
+                nq, nc, mask = 12, [3, 8][trial % 2], [0, 2][trial // 2]
+                Qf = torch.nn.functional.normalize(torch.randn(nq, 128, device=dev, generator=g), dim=-1).half()
+                topc, sc, _ = native_prep(Qf, C128, nc, impute=True, compact=True)
+                idx.set_residual_lut(residual_lut(Qf, bw, rbm, dt) if tokens else torch.empty(0))
+                out = {}
+                for hsh in (False, True):
+                    X.set_stage3_hash(hsh)
+                    p, a = idx.candidates(torch.zeros(nq, S, 3, device=dev), topc, sc, nc, N, mask, E)
+                    p, a = p.cpu().numpy(), a.cpu().numpy()
+                    keep = p >= 0
+                    out[hsh] = dict(zip(p[keep].tolist(), a[keep].tolist()))
+                assert set(out[False]) == set(out[True]), (tokens, trial, len(out[False]), len(out[True]))
+                d = max((abs(out[False][k] - out[True][k]) for k in out[False]), default=0.0)
+                assert d < 1e-4 * nq, (tokens, trial, d)
+                if mask:
+                    assert all(pred[k] & mask for k in out[True]), "hash path let a failing passage through"
+                checked += 1
+        finally:
+            X.set_stage3_hash(False); X.set_codeword_weight(1.0); X.set_compact_scores(False)
+            idx.set_residual_lut(torch.empty(0)); idx.set_stage1_mode(0)
+    assert not X.get_stage3_hash()
+    print(f"  hash-table Stage 3 == radix-sort Stage 3 on {checked} queries (dedup + token-level/residual, with/without filter)")
+
+
 if __name__ == "__main__":
     for E in (256, 1024, 4096):
         test_stage1(E)
@@ -464,4 +521,5 @@ if __name__ == "__main__":
     test_codeword_weight()
     test_residual_scoring()
     test_graph_path()
+    test_hash_stage3()
     print("ALL GPU KERNEL TESTS PASSED")

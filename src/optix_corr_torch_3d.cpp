@@ -83,6 +83,8 @@ extern "C" void ragrt_set_rerank_mode(int mode);
 extern "C" int  ragrt_get_rerank_mode();
 extern "C" void ragrt_set_codeword_weight(float w);
 extern "C" float ragrt_get_codeword_weight();
+extern "C" void ragrt_set_stage3_hash(int on);
+extern "C" int ragrt_get_stage3_hash();
 extern "C" void ragrt_set_compact_scores(int on);
 extern "C" int ragrt_get_compact_scores();
 extern "C" void ragrt_set_residual_scoring(const uint32_t* tok_ids, const uint8_t* residuals, const float* lut);
@@ -841,6 +843,7 @@ public:
         d["eid_bytes"] = b_eid_bytes;
         d["codeword_weight"] = ragrt_get_codeword_weight();
         d["compact_scores"] = ragrt_get_compact_scores();
+        d["stage3_hash"] = ragrt_get_stage3_hash();
         d["residual_scoring"] = ragrt_residual_scoring_on();
         d["token_level_index"] = b_token_ids.defined();
         pybind11::list lv;
@@ -943,6 +946,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("set_compact_scores", [](bool on) { ragrt_set_compact_scores(on ? 1 : 0); },
           "Stage 2 reads centroid scores as [ntok, k_cent] aligned with topc (true) or [ntok, num_centroids]");
     m.def("get_compact_scores", []() { return ragrt_get_compact_scores() != 0; });
+    m.def("set_stage3_hash", [](bool on) { ragrt_set_stage3_hash(on ? 1 : 0); },
+          "sparse Stage 3 by hash tables (true) instead of a radix sort (false, default)");
+    m.def("get_stage3_hash", []() { return ragrt_get_stage3_hash() != 0; });
     m.def("get_rerank_mode", []() { return std::string(ragrt_get_rerank_mode() == 1 ? "wmma" : "simt"); });
     m.def("bruteforce_stage1", &bruteforce_stage1_standalone,
           "Exact top-k positive codewords per ray on CUDA cores: (q [R,3], codewords [32*E,3], k, max_hits) -> (ids, vals, counts)");

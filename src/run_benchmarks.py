@@ -47,13 +47,14 @@ import torch
 
 import eval_config as C
 import eval_lib as E
-from engines import Engines, cfg_key, RAGRT_ENGINES, RESID_ENGINES, GRAPH_ENGINES
+from engines import Engines, cfg_key, RAGRT_ENGINES, RESID_ENGINES, GRAPH_ENGINES, ADAPT_ENGINES
 import rtrag_corr_3d
 
 CORE = ["plaid", "ptms", "ragrt"]          # the primary operating point must be reachable by these
 # ablations: no-RT Stage 1; codebook filter off; no codeword score; plain IVF on RAGRT kernels; MUVERA
 ENGINES = CORE + ["ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft_noimpute", "weft",
-                  "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "muvera"]
+                  "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph",
+                  "weft_hash", "weft_adapt", "muvera"]
 # (slow, fast, what the step from slow to fast changes); ratio = latency(slow) / latency(fast)
 ATTRIBUTION = [
     ("ptms", "ragrt_ivf", "engine: PLAID candidate generation -> same algorithm on RAGRT kernels"),
@@ -75,7 +76,12 @@ ATTRIBUTION = [
     ("weft", "weft_resid_norr", "WEFT vs a WARP-style GPU pipeline (no rerank)"),
     ("weft", "weft_graph", "CUDA graphs + one sync (launch and sync overhead)"),
     ("ptms", "weft_graph", "WEFT (graphs) vs PLAID+TMS"),
+    ("weft", "weft_hash", "hash-table Stage 3 instead of a radix sort"),
+    ("ptms", "weft_hash", "WEFT (hash Stage 3) vs PLAID+TMS"),
 ]
+# filter_budget stage: PLAID / PLAID+TMS post-filtering with growing candidate budgets
+FILTER_BUDGETS = [{"ncells": 2, "threshold": 0.45, "ndocs": 1024}, {"ncells": 4, "threshold": 0.4, "ndocs": 4096},
+                  {"ncells": 8, "threshold": 0.35, "ndocs": 16384}, {"ncells": 16, "threshold": 0.3, "ndocs": 65536}]
 DEFAULT_ENGINES = CORE + ["ragrt_bf"]
 PLAID_DEFAULT_K100 = {"ncells": 2, "threshold": 0.45, "ndocs": 1024}   # ColBERT Searcher defaults for k=100
 
@@ -257,7 +263,7 @@ class Bench:
         grids = {"plaid": plaid_grid, "ptms": plaid_grid, "ragrt": ragrt_grid, "ragrt_bf": ragrt_grid,
                  "ragrt_nofilter": nof, "ragrt_centroid": ragrt_grid, "ragrt_ivf": nof,
                  "weft": nof, "weft_noimpute": nof, "weft_tok": nof, "weft_resid": nof,
-                 "weft_resid_norr": NORR_GRID[:2] if self.args.quick else NORR_GRID, "weft_graph": nof,
+                 "weft_resid_norr": NORR_GRID[:2] if self.args.quick else NORR_GRID, "weft_graph": nof, "weft_hash": nof, "weft_adapt": nof,
                  "muvera": MUVERA_GRID[:2] if self.args.quick else MUVERA_GRID}
         if PLAID_DEFAULT_K100 not in grids["plaid"]:
             grids["plaid"] = grids["plaid"] + [PLAID_DEFAULT_K100]
@@ -480,11 +486,31 @@ class Bench:
         for f in filts:
             out.setdefault(f, {})
             for engine, p in P.items():
+                self.eng.adapt_log = []
                 res = self.evaluate(engine, p, qids, filt=f)
                 out[f][engine] = self.summarize(res)
+                log = getattr(self.eng, "adapt_log", None)
+                if engine in ADAPT_ENGINES and log:
+                    out[f][engine]["adapt_nc_mean"] = float(np.mean(log))
             row = "  ".join(f"{e} {out[f][e]['lat']['median']:.2f}ms r10={out[f][e]['gt_r10']['mean']:.3f}"
                             for e in out[f])
             print(f"    filter {f:<10} {row}", flush=True)
+
+    def stage_filter_budget(self):
+        """Can post-filtering catch up with a bigger candidate budget, and at what latency? PLAID and
+        PLAID+TMS at FILTER_BUDGETS on the hard filters (default corr_mid, corr_far, syn5)."""
+        filts = self.args.filters or [f for f in ("corr_mid", "corr_far", "syn5") if f in self.gt_names]
+        qids = self.test[:self.args.budget_queries]
+        out = self.R.setdefault("filter_budget", {})
+        for f in filts:
+            for e in ("plaid", "ptms"):
+                for b in FILTER_BUDGETS:
+                    res = self.evaluate(e, b, qids, filt=f)
+                    k = f"nc={b['ncells']} th={b['threshold']} ndocs={b['ndocs']}"
+                    out.setdefault(f, {}).setdefault(e, {})[k] = {"params": b, **self.summarize(res)}
+                    v = out[f][e][k]
+                    print(f"    budget {f:<9} {e:<5} {k:<28} r10={v['gt_r10']['mean']:.3f}  {v['lat']['median']:.2f} ms", flush=True)
+                self.save()
 
     def stage_throughput(self):
         P = self.primary()
@@ -504,7 +530,7 @@ class Bench:
                 out[f"{engine}_sequential_qps"] = timed(
                     lambda batch, e=engine: [self.eng.search(e, Qf, n, P[e]) for Qf, n in batch])
         for e in RAGRT_ENGINES:
-            if e not in P or e in RESID_ENGINES or e in GRAPH_ENGINES:   # one LUT / one graph at a time
+            if e not in P or e in RESID_ENGINES or e in GRAPH_ENGINES or e in ADAPT_ENGINES:   # per-query state
                 continue
             self.eng.use_engine(e)
             pe = self.eng.resolve(e, P[e])
@@ -633,6 +659,7 @@ def main():
                     help="query encoder (stage 0a): ColBERT's own, or fast_encoder.py (fp16 + CUDA graph)")
     ap.add_argument("--filters", type=lambda s: s.split(","), default=None,
                     help="filtered stage: only these filters (e.g. corr_near,corr_mid,corr_far)")
+    ap.add_argument("--budget_queries", type=int, default=500, help="TEST queries per point in the filter_budget stage")
     ap.add_argument("--filtered_extra", type=lambda s: s.split(","), default=None,
                     help="filtered stage: also run these (e.g. imported) engines at their selected configs, e.g. plaid,ptms")
     args = ap.parse_args()

@@ -30,6 +30,10 @@ The three retrieval engines behind one interface, for benchmarks and profiling.
              pipeline (imputation + implicit decompression, no rerank) ported to the GPU.
   weft_graph : weft run as two CUDA graph replays with one mid-query sync (graph_search.py):
              same candidates and results as weft, less launch and sync overhead.
+  weft_hash : weft with the hash-table Stage 3 (no radix sort): same scores, less Stage-3 time.
+  weft_adapt : weft + adaptive probing under a filter: when the probed centroids' lists hold fewer
+             passing postings than an uncorrelated filter would (per-centroid filter-bit counts,
+             centroid_bit_counts.npy), probe up to ADAPT_CAP x nc centroids (anti-correlated filters).
   muvera   : MUVERA fixed-dimensional encodings (build_muvera_fde.py), exact GPU inner
              product over all passages, then the same TileMaxSim rerank. Grid: cands.
 
@@ -65,7 +69,7 @@ from colbert.search.strided_tensor import StridedTensor
 from colbert.modeling.colbert import colbert_score_reduce
 import rtrag_corr_3d
 import ragrt_index_lib as L
-from weft_prep import native_prep, residual_lut, residual_byte_weights
+from weft_prep import native_prep, residual_lut, residual_byte_weights, adaptive_probe
 
 NEG_INF = float("-inf")
 
@@ -78,7 +82,10 @@ def ragrt_cfg_key(p):
     return f"nc={p['nc']} eids={p['eids']} ndocs={p['ndocs']}"
 
 
-WEFT_ENGINES = ("weft", "weft_noimpute", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph")
+WEFT_ENGINES = ("weft", "weft_noimpute", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "weft_hash", "weft_adapt")
+HASH_ENGINES = ("weft_hash",)
+ADAPT_ENGINES = ("weft_adapt",)          # per-query nc: no batched pipeline
+ADAPT_CAP = 4
 GRAPH_ENGINES = ("weft_graph",)          # CUDA-graph path: no per-stage profile, no batched pipeline
 RESID_ENGINES = ("weft_resid", "weft_resid_norr")       # need a token-level index (csr_token_ids.npy)
 TOKEN_ENGINES = ("weft_tok",) + RESID_ENGINES
@@ -93,7 +100,8 @@ CODEWORD_WEIGHT = {"ragrt": 1.0, "ragrt_bf": 1.0, "ragrt_nofilter": 1.0,   # wei
 # resid = add q.r per posting (residual LUT; token-level index only).
 PREP = {"weft": ("native", True, True, False), "weft_noimpute": ("native", False, True, False),
         "weft_tok": ("native", True, True, False), "weft_resid": ("native", True, True, True),
-        "weft_resid_norr": ("native", True, True, True), "weft_graph": ("native", True, True, False)}
+        "weft_resid_norr": ("native", True, True, True), "weft_graph": ("native", True, True, False),
+        "weft_hash": ("native", True, True, False), "weft_adapt": ("native", True, True, False)}
 NO_PREP = ("svd96", False, False, False)
 
 
@@ -151,6 +159,11 @@ class Engines:
         self.prep_mode = NO_PREP
         self.has_token_ids = False
         self.graph = None
+        self.adapt = False
+        self.cur_mask = 0
+        self.cbc = None                 # per-centroid filter-bit counts (weft_adapt)
+        self.sel_cache = {}
+        self.adapt_log = []
         self.zero_sub = None
         self.res_wb = None
         self.index = None
@@ -332,6 +345,9 @@ class Engines:
             if self.zero_sub is None:
                 self.zero_sub = torch.zeros(32, L.NUM_SUBSPACES, L.SUBSPACE_DIM, device="cuda")
             Q_sub = self.zero_sub[:ntok]
+            if self.adapt and self.cur_mask:
+                topc, scores = self.adaptive_prep(Qf[:ntok], nc, self.cur_mask)
+                return Q_sub, scores, topc
             topc, scores, _ = native_prep(Qf[:ntok], self.centroids_fp16, nc, impute, compact)
             if resid:   # read by the next Stage 3 (a global in the extension; one query at a time)
                 if self.res_wb is None:
@@ -344,12 +360,72 @@ class Engines:
         topc = scores.topk(k=nc, dim=-1).indices.to(torch.int32).contiguous()
         return Q_sub, scores, topc
 
+    # ------------------------------------------------------------ adaptive probing (weft_adapt)
+    def centroid_bit_counts(self):
+        """[num_centroids, 33] int64: per centroid, postings whose passage has predicate bit b (b < 32),
+        and all postings (col 32). Cached next to the index, recomputed when predicates.npy changes."""
+        d = self.ds["sparse_csr_dir"]
+        cache = os.path.join(d, "centroid_bit_counts.npy")
+        pp = self.ds["predicates_path"]
+        if os.path.exists(cache) and os.path.getmtime(cache) >= os.path.getmtime(pp):
+            return np.load(cache)
+        print(f"  computing per-centroid filter-bit counts for {d} (once)", flush=True)
+        rp = np.load(os.path.join(d, "csr_row_ptrs.npy"))[0].astype(np.int64)
+        lengths = np.load(os.path.join(d, "csr_lengths.npy")).astype(np.int64)
+        packed = np.load(os.path.join(d, "csr_packed_24.npy"), mmap_mode="r")
+        NC = len(rp) - 1
+        n_lists = int(rp[-1])
+        list_c = (np.searchsorted(rp, np.arange(n_lists), side="right") - 1).astype(np.int64)
+        starts = np.concatenate([[0], np.cumsum(lengths[:n_lists])])
+        out = np.zeros((NC, 33), dtype=np.int64)
+        a = 0
+        while a < n_lists:
+            b = int(np.searchsorted(starts, starts[a] + 50_000_000, side="right")) - 1
+            b = min(max(b, a + 1), n_lists)
+            p0, p1 = int(starts[a]), int(starts[b])
+            pids = L.unpack_pids_24(np.asarray(packed[3 * p0:3 * p1]))
+            cent = np.repeat(list_c[a:b], lengths[a:b])
+            pred = self.pred_np[pids]
+            out[:, 32] += np.bincount(cent, minlength=NC)
+            for bit in range(32):
+                sel = ((pred >> np.uint32(bit)) & np.uint32(1)).astype(bool)
+                if sel.any():
+                    out[:, bit] += np.bincount(cent[sel], minlength=NC)
+            a = b
+        np.save(cache, out)
+        return out
+
+    def selectivity(self, mask):
+        if mask not in self.sel_cache:
+            self.sel_cache[mask] = float(((self.pred_gpu & mask) != 0).float().mean())
+        return self.sel_cache[mask]
+
+    @torch.no_grad()
+    def adaptive_prep(self, Q, nc, mask):
+        """Probe deeper when the filter is anti-correlated with the query. For each query token,
+        target = (global pass rate) x (postings in its top-nc lists): the passing postings an
+        uncorrelated filter would leave. Probe the smallest nc' in [nc, ADAPT_CAP * nc] whose lists
+        hold that many passing postings (per-centroid bit counts; exact for one-bit masks, an upper
+        bound for several bits), then use the largest nc' over tokens. Imputation uses the
+        (nc' + 1)-th score. Returns (topc [ntok, nc'] int32, compact shifted scores [ntok, nc'])."""
+        if self.cbc is None:
+            c = torch.from_numpy(self.centroid_bit_counts()).cuda()
+            self.cbc = {"bits": c[:, :32].float(), "tot": c[:, 32].float()}
+        bits = torch.tensor([float((mask >> b) & 1) for b in range(32)], device=self.cbc["bits"].device)
+        pass_c = self.cbc["bits"] @ bits                                   # [NC]
+        ncap = min(ADAPT_CAP * nc, self.centroids_fp16.shape[0] - 1)
+        topc, scores, nc2 = adaptive_probe(Q, self.centroids_fp16, nc, ncap, pass_c, self.cbc["tot"], self.selectivity(mask))
+        self.last_adapt_nc = nc2
+        self.adapt_log.append(nc2)
+        return topc, scores
+
     @torch.no_grad()
     def ragrt_candidates(self, Qf, ntok, p, mask=0):
         """Stages 0b-3 only: (candidate pids with -1 padding, approximate scores)."""
         self.ensure_calibrated()
+        self.cur_mask = mask
         Q_sub, scores, topc = self.ragrt_prep(Qf, ntok, p["nc"])
-        return self.index.candidates(Q_sub, topc, scores, p["nc"], self.ndocs(p), mask, p["eids"])
+        return self.index.candidates(Q_sub, topc, scores, topc.shape[1], self.ndocs(p), mask, p["eids"])
 
     def use_engine(self, engine):
         """Set Stage 1 mode, the Stage 2 codeword weight and the prep for a RAGRT engine."""
@@ -360,6 +436,8 @@ class Engines:
         rtrag_corr_3d.set_codeword_weight(CODEWORD_WEIGHT[engine])
         self.prep_mode = PREP.get(engine, NO_PREP)
         rtrag_corr_3d.set_compact_scores(self.prep_mode[2])
+        rtrag_corr_3d.set_stage3_hash(engine in HASH_ENGINES)
+        self.adapt = engine in ADAPT_ENGINES
         if not self.prep_mode[3]:
             self.index.set_residual_lut(torch.empty(0))
 
@@ -388,9 +466,10 @@ class Engines:
     @torch.no_grad()
     def ragrt(self, Qf, ntok, p, mask=0):
         self.ensure_calibrated()
+        self.cur_mask = mask
         Q_sub, scores, topc = self.ragrt_prep(Qf, ntok, p["nc"])
         out = self.index.search_single_query_native(
-            Qf.float(), Qf, Q_sub, topc, scores, p["nc"], self.ndocs(p), C.TOP_K,
+            Qf.float(), Qf, Q_sub, topc, scores, topc.shape[1], self.ndocs(p), C.TOP_K,
             query_mask=mask, k_eids=p["eids"])
         # Padding (-1, when fewer candidates exist than ndocs) and, under a very selective
         # filter, failing pids (scored -inf) can reach the top-k; drop them.
@@ -402,10 +481,11 @@ class Engines:
         self.ensure_calibrated()
         e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         e0.record()
+        self.cur_mask = 0
         Q_sub, scores, topc = self.ragrt_prep(Qf, ntok, p["nc"])
         e1.record()
         out, st = self.index.search_single_query_profiled(
-            Qf.float(), Qf, Q_sub, topc, scores, p["nc"], self.ndocs(p), C.TOP_K,
+            Qf.float(), Qf, Q_sub, topc, scores, topc.shape[1], self.ndocs(p), C.TOP_K,
             query_mask=0, k_eids=p["eids"])
         torch.cuda.synchronize()
         return [x for x in out.tolist() if x >= 0], [e0.elapsed_time(e1)] + list(st)
@@ -414,6 +494,7 @@ class Engines:
     def ragrt_pipelined(self, Qfs, ntoks, p, mask=0):
         """Throughput path: prep every query, then the dual-stream pipelined search."""
         self.ensure_calibrated()
+        self.cur_mask = 0
         preps = [self.ragrt_prep(q, n, p["nc"]) for q, n in zip(Qfs, ntoks)]
         out = self.index.search_batch_pipelined(
             [q.float() for q in Qfs], list(Qfs), [x[0] for x in preps], [x[2] for x in preps],

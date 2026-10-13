@@ -70,3 +70,20 @@ def residual_dot_reference(q, residual_bytes, bucket_weights, reversed_bit_map, 
 def imputed_passage_scores(best, found, m):
     """Reference for the tests: best/found [P, T] per passage and token, m [T] -> imputed sums."""
     return torch.where(found, best, m[None, :]).sum(1)
+
+
+def adaptive_probe(Q, C, nc, ncap, pass_c, tot_c, sel):
+    """Adaptive probing under a filter (engine weft_adapt). pass_c / tot_c [NC]: postings per centroid
+    whose passage passes the filter / all postings; sel: global pass rate. For each query token the
+    target is sel x (postings in its top-nc lists), the passing postings an uncorrelated filter would
+    leave; the token needs the smallest nc' in [nc, ncap] whose top-nc' lists hold that many passing
+    postings. Uses the largest nc' over tokens (one k_cent per query), imputation at the (nc'+1)-th
+    score. Returns (topc int32 [ntok, nc'], compact shifted scores float32 [ntok, nc'], nc')."""
+    s = Q @ C.T
+    vals, idx = s.topk(ncap + 1, dim=-1)
+    target = sel * tot_c[idx[:, :nc]].sum(1)
+    cum = pass_c[idx[:, :ncap]].cumsum(1)
+    need = (cum < target[:, None]).sum(1) + 1
+    nc2 = int(need.clamp(nc, ncap).max())
+    m = vals[:, nc2].float()
+    return idx[:, :nc2].to(torch.int32).contiguous(), (vals[:, :nc2].float() - m[:, None]).contiguous(), nc2

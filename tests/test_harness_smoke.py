@@ -33,7 +33,7 @@ DOCS = torch.tensor(RNG.normal(size=(N_DOCS, DIM)), dtype=torch.float32)
 
 FAKE_RESID = ("weft_resid", "weft_resid_norr")
 FAKE_RAGRT = ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft", "weft_noimpute",
-              "weft_tok", "weft_graph") + FAKE_RESID
+              "weft_tok", "weft_graph", "weft_hash", "weft_adapt") + FAKE_RESID
 
 
 def cfg_key(engine, p):
@@ -127,6 +127,7 @@ eng_mod = types.ModuleType("engines")
 eng_mod.Engines, eng_mod.cfg_key, eng_mod.RAGRT_ENGINES = FakeEngines, cfg_key, FAKE_RAGRT
 eng_mod.RESID_ENGINES = FAKE_RESID
 eng_mod.GRAPH_ENGINES = ("weft_graph",)
+eng_mod.ADAPT_ENGINES = ("weft_adapt",)
 sys.modules["engines"] = eng_mod
 
 import eval_config as C
@@ -274,6 +275,24 @@ def main():
     run_benchmarks.main()
     R5 = json.load(open(os.path.join(src, "resid", "results.json")))
     assert {"plaid", "ptms", "weft_graph"} <= set(R5["filtered"]["corr_far"]) and "corr_mid" not in R5["filtered"]
+
+    # hash / adaptive engines + the post-filter budget sweep (default filters: those present among corr_mid, corr_far, syn5)
+    sys.argv = ["run_benchmarks.py", "--dataset", "msmarco", "--quick", "--tune_size", "60", "--results_subdir", "tue",
+                "--baseline_from", os.path.join(src, "resid"), "--import_engines", "plaid,ptms,weft,weft_graph",
+                "--core", "plaid,ptms,weft", "--engines", "weft_hash,weft_adapt",
+                "--stages", "sweep,select,test,throughput,filtered,filter_budget", "--repeats", "1",
+                "--max_filter_queries", "40", "--budget_queries", "30", "--throughput_queries", "32", "--targets", "0.5,0.9"]
+    run_benchmarks.main()
+    R6 = json.load(open(os.path.join(src, "tue", "results.json")))
+    assert set(R6["filter_budget"]) == {"corr_far", "syn5"}, R6["filter_budget"].keys()
+    assert all(len(R6["filter_budget"][f][e]) == 4 for f in R6["filter_budget"] for e in ("plaid", "ptms"))
+    assert "weft_adapt_pipelined_qps" not in R6["throughput"] and "weft_hash_pipelined_qps" in R6["throughput"]
+    steps = {(a["slow"], a["fast"]) for c in R6["comparisons"].values() for a in c.get("attribution", [])}
+    assert ("weft", "weft_hash") in steps, steps
+    sys.argv = ["plot_results.py", "--dataset", "msmarco", "--results_subdir", "tue"]
+    plot_results.main()
+    md6 = open(os.path.join(src, "tue", "summary.md")).read()
+    assert "Post-filtering with larger candidate budgets" in md6 and "## Filtered search" in md6
 
     sys.argv = ["plot_results.py", "--dataset", "msmarco"]
     plot_results.main()

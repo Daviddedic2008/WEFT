@@ -143,6 +143,30 @@ def test_corr_filters():
     print("  correlated filters: passage means, topic ranking, predicate bits 16-31 replaced, low bits kept")
 
 
+def test_adaptive_probe():
+    from weft_prep import adaptive_probe
+    g = torch.Generator().manual_seed(4)
+    C = torch.nn.functional.normalize(torch.randn(200, 128, generator=g), dim=-1)
+    Q = torch.nn.functional.normalize(torch.randn(6, 128, generator=g), dim=-1)
+    tot = torch.full((200,), 100.0)
+    order = (Q @ C.T).argsort(dim=-1, descending=True)
+    nc, ncap = 4, 16
+    # filter uncorrelated with the query (10% of every list passes): no extra probing
+    t, s, n = adaptive_probe(Q, C, nc, ncap, torch.full((200,), 10.0), tot, 0.10)
+    assert n == nc and t.shape == (6, nc) and torch.equal(t.long(), order[:, :nc])
+    full = Q @ C.T
+    assert torch.allclose(s, full.gather(1, order[:, :nc]) - full.gather(1, order[:, nc:nc + 1]), atol=1e-6)
+    # anti-correlated: the query's nearest lists hold no passing postings -> probe to the cap
+    near = torch.zeros(200, dtype=torch.bool); near[order[:, :12].flatten()] = True
+    pass_c = torch.where(near, 0.0, 1.0)
+    t, s, n = adaptive_probe(Q, C, nc, ncap, pass_c, tot, 0.10)
+    assert n == ncap and (s >= -1e-6).all()
+    # positively correlated: everything near the query passes -> nc unchanged
+    t, s, n = adaptive_probe(Q, C, nc, ncap, torch.where(near, 100.0, 0.0), tot, 0.06)
+    assert n == nc
+    print("  adaptive probing: uncorrelated / correlated filters keep nc, anti-correlated probes to the cap")
+
+
 def test_muvera_matches_reference():
     cfg, P = M.make_params(dim=24, reps=4, k_sim=3, d_proj=6, seed=2)
     rng = np.random.default_rng(1)
@@ -214,6 +238,7 @@ if __name__ == "__main__":
     test_compact_prep()
     test_bucket_cap()
     test_corr_filters()
+    test_adaptive_probe()
     test_muvera_matches_reference()
     test_muvera_tracks_chamfer()
     test_native_prep_and_imputation()
