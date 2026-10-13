@@ -14,6 +14,8 @@ SCR=/local/scratch/a/cashman3
 REPO=$SCR/xtr-warp; VENV=$SCR/venvs/warp; LOTTE=$SCR/lotte
 OUT="${RAGRT_RESULTS:-$SCR/ragrt_results}/lotte"
 export TMPDIR=$SCR/tmp; mkdir -p "$TMPDIR"
+# WARP reads these from the environment (its .env is only a fallback)
+export INDEX_ROOT=$SCR/warp_indexes EXPERIMENT_ROOT=$SCR/warp_experiments BEIR_COLLECTION_PATH=$SCR/beir LOTTE_COLLECTION_PATH=$LOTTE
 STEPS="${*:-setup index search}"
 for st in $STEPS; do
   echo "================ warp $st"
@@ -44,6 +46,8 @@ PY
           $SCR/warp_indexes $SCR/warp_experiments $SCR/beir "$LOTTE" > "$REPO/.env"
       (cd "$REPO" && PYTHONPATH="$REPO" "$VENV/bin/python" -c "import torch, faiss, warp, warp.engine.config, warp.engine.searcher, warp.data.queries, warp.engine.utils.collection_indexer, warp.engine.utils.index_converter; print('warp import ok, torch', torch.__version__)") ;;
     index)
+      [ -f "$LOTTE/pooled/dev/collection.tsv" ] || { echo "FATAL: $LOTTE/pooled/dev/collection.tsv missing"; exit 1; }
+      mkdir -p $SCR/warp_indexes $SCR/warp_experiments
       free=$(df -BG --output=avail $SCR | tail -1 | tr -dc 0-9)
       [ "$free" -ge 30 ] || { echo "FATAL: only ${free} GB free on scratch (need ~30)"; exit 1; }
       cd "$REPO" && PYTHONPATH="$REPO" "$VENV/bin/python" "$HERE/warp_lotte.py" index --nbits 2 --out "$OUT" ;;

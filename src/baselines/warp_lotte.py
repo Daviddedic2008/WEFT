@@ -22,8 +22,12 @@ def main():
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    from dotenv import load_dotenv
-    load_dotenv()
+    from dotenv import load_dotenv, find_dotenv
+    load_dotenv(find_dotenv(usecwd=True))          # the .env in the xtr-warp checkout (cwd), not next to this file
+    missing = [k for k in ("INDEX_ROOT", "EXPERIMENT_ROOT", "LOTTE_COLLECTION_PATH", "BEIR_COLLECTION_PATH")
+               if k not in os.environ]
+    if missing:
+        sys.exit(f"FATAL: {missing} not set (run_warp.sh exports them; or run from the xtr-warp checkout)")
     from warp.engine.config import WARPRunConfig
 
     base = dict(collection="lotte", dataset="pooled", type_="search", datasplit="dev", nbits=args.nbits, k=100)
