@@ -1,6 +1,6 @@
 """
-Paper-style figures from saved results, in the spirit of the old generate_figures.py, but nothing is
-measured here: every number comes from results.json files written by run_benchmarks.py,
+Paper-style figures, in the spirit of the old generate_figures.py. To measure everything fresh and
+then plot, use run_figures.sh (one new run, no imported results). This script itself only plots: every number comes from results.json files written by run_benchmarks.py,
 bench_fastplaid.py, run_attribution.sh (MUVERA), baselines/warp_lotte.py and baselines/juno.
 
 Unlike plot_results.py (one run, every engine), this draws a curated comparison:
@@ -85,6 +85,21 @@ class Results:
         self.W = jload(wp)
         self.show_rt = a.with_rt
         self.sources = {"main": os.path.join(root, a.main), "muvera": mu, "fastplaid": fp, "warp": wp}
+        # Results from a separate run older than the main run are flagged (and dropped with --drop_stale),
+        # so a figure never silently mixes today's numbers with an old run's.
+        t_main = os.path.getmtime(os.path.join(root, a.main, "results.json"))
+        self.stale = []
+        for name, attr in (("muvera", "MU"), ("fastplaid", "FP"), ("warp", "W")):
+            p = self.sources[name]
+            p = p if p is None or p.endswith(".json") else os.path.join(p, "results.json")
+            if getattr(self, attr) is not None and os.path.getmtime(p) < t_main - 6 * 3600:
+                self.stale.append(name)
+                print(f"  WARNING: {name} results ({p}) are older than the main run"
+                      + ("; dropped (--drop_stale)" if a.drop_stale else "; pass --drop_stale to leave them out"))
+                if a.drop_stale:
+                    setattr(self, attr, None)
+        if self.MU is not None and self.M.get("sweep", {}).get("muvera"):
+            self.MU = None                      # measured in the main run: use that, not a separate run
 
     def src(self, name):
         """Which results dict holds this engine, and its id there."""
@@ -465,13 +480,16 @@ def main():
     ap.add_argument("--ours", default="weft", help="engine id shown as RAGRT (weft, weft_graph, ...)")
     ap.add_argument("--target", default=None, help="selection target name (default: the run's primary)")
     ap.add_argument("--muvera", default=None); ap.add_argument("--fastplaid", default=None); ap.add_argument("--warp", default=None)
-    ap.add_argument("--with_rt", action="store_true", help="also show the RT-core design")
+    ap.add_argument("--with_rt", action="store_true", help="also show the RT-core design (needs it in the main run)")
+    ap.add_argument("--drop_stale", action="store_true", help="leave out baseline results older than the main run")
     a = ap.parse_args()
     ds = C.dataset(a.dataset)
     X = Results(a, ds)
     out = os.path.join(X.root, a.main, "figures")
     os.makedirs(out, exist_ok=True)
     md = [f"# Figures for {a.dataset} / {a.main}\n", "Sources: " + ", ".join(f"{k} = {v}" for k, v in X.sources.items()) + "\n"]
+    if X.stale:
+        md.append(f"**Stale (older than the main run{', left out' if a.drop_stale else ''}): {', '.join(X.stale)}**\n")
     for f in (fig_headline, fig_pareto, fig_breakdown, fig_throughput, fig_filters, fig_selectivity,
               fig_budget, fig_attribution, fig_oracle_ablation):
         try:

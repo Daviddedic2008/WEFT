@@ -5,7 +5,7 @@
 # Steps (default: build gpu_tests attribution phrt muvera fastplaid4):
 #   fastplaid2 build gpu_tests cpu_tests attribution phrt muvera fastplaid4 msmarco_check
 #   lotte_corr lotte_graph msmarco_encode msmarco_corr msmarco_graph lotte_tue msmarco_tue
-#   lotte_wed msmarco_wed lotte_thu msmarco_thu lotte_oracle msmarco_oracle lotte_oracle2 msmarco_oracle2 warp_setup warp_index warp_search
+#   lotte_wed msmarco_wed lotte_thu msmarco_thu lotte_oracle msmarco_oracle lotte_oracle2 msmarco_oracle2 figs_lotte figs_msmarco juno warp_setup warp_index warp_search
 # Progress: cat ~/overnight/STATUS
 set -u
 cd "$(dirname "$0")"
@@ -79,6 +79,8 @@ for st in $STEPS; do case "$st" in
   msmarco_oracle) [ $BOK = 1 ] && step msmarco_oracle "./run_attribution.sh msmarco v1 oracle" ;;
   lotte_oracle2)  [ $BOK = 1 ] && step lotte_oracle2   "./run_attribution.sh lotte v3_ablation oracle2" ;;
   msmarco_oracle2) [ $BOK = 1 ] && step msmarco_oracle2 "./run_attribution.sh msmarco v1 oracle2" ;;
+  figs_lotte)     [ $BOK = 1 ] && step figs_lotte   "./run_figures.sh lotte" ;;
+  figs_msmarco)   [ $BOK = 1 ] && step figs_msmarco "./run_figures.sh msmarco" ;;
   juno)           step juno        "./baselines/juno/run_juno.sh" ;;
   warp_setup)     step warp_setup  "./baselines/run_warp.sh setup" ;;
   warp_index)     step warp_index  "./baselines/run_warp.sh index" ;;
