@@ -14,3 +14,5 @@ reference/
 src/lotte/
 src/msmarco/
 *.DS_Store
+src/baselines/juno/juno_bench
+src/baselines/juno/*.ptx
