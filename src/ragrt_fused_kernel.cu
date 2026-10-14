@@ -434,7 +434,7 @@ __global__ void sparse_fixup_kernel(
 // Stage 3, hash (no sort). Table 1: open addressing over 64-bit slots
 // [key + 1 (48 bits) | fp16 score bits (16)], key = pid * 32 + token: keeps the max score per
 // (passage, token). Table 2: pid + 1 -> float sum of those maxima. Failing (filtered) postings
-// never enter the tables. Both tables fit in L2 at the sizes WEFT uses (a few MB to ~30 MB).
+// never enter the tables. Both tables fit in L2 at the sizes RAGRT uses (a few MB to ~30 MB).
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ unsigned long long hash_slot(unsigned long long key, int log2cap) {
     return (key * 0x9E3779B97F4A7C15ULL) >> (64 - log2cap);

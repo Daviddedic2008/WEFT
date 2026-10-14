@@ -41,12 +41,12 @@ PY
       fi ;;
     gt)
       python3 build_ground_truth.py --dataset msmarco ;;     # resumes; a no-op when complete
-    ivf)   # plain-IVF index (WEFT's index): ~0.7 deduplicated postings per token, a few GB
+    ivf)   # plain-IVF index (RAGRT's index): ~0.7 deduplicated postings per token, a few GB
       [ -f "$SCR/msmarco_plain_ivf/csr_packed_24.npy" ] || python3 build_plain_ivf.py --index "$INDEX" \
           --collection "$(python3 -c "import eval_config as C; print(C.dataset('msmarco')['collection'])")" \
           --src_dir "$CSR" --outdir "$SCR/msmarco_plain_ivf"
       python3 check_index.py "$SCR/msmarco_plain_ivf" ;;
-    bench)  # main comparison on the plain-IVF index: PLAID, PLAID+TMS, WEFT and its ablations
+    bench)  # main comparison on the plain-IVF index: PLAID, PLAID+TMS, RAGRT and its ablations
       python3 run_benchmarks.py --dataset msmarco --results_subdir "$SUB" --sparse_csr_dir "$SCR/msmarco_plain_ivf" \
           --engines plaid,ptms,ragrt_ivf,weft_noimpute,weft --core plaid,ptms,weft
       python3 plot_results.py --dataset msmarco --results_subdir "$SUB" ;;

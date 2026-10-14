@@ -1,7 +1,7 @@
 """
 Fast ColBERT query encoder (stage 0a), a drop-in for Searcher.encode on one query or a batch.
 
-Stock encoding takes ~5 ms per query on an RTX 6000 Ada, about 8x WEFT's retrieval. Its GPU work
+Stock encoding takes ~5 ms per query on an RTX 6000 Ada, about 8x RAGRT's retrieval. Its GPU work
 is tiny (BERT-base on 32 tokens); the time is Python and launch overhead: HuggingFace's module
 tree, autocast, ColBERT's batching helpers, ~150 small kernels launched one by one.
 

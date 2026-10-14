@@ -13,7 +13,7 @@ GPU tests (run on the server after building the extension and the PTX):
    reference of sum_t max over the passage's probed tokens of max(s_tc - m_t + q_t.r, 0);
    compact scores == full scores; LUT off == centroid-only scores.
 6. CUDA-graph path (graph_search.py, engine weft_graph) returns the same results as the eager
-   WEFT path, with and without a filter, across graph re-use and capacity buckets.
+   RAGRT path, with and without a filter, across graph re-use and capacity buckets.
 7. Hash-table Stage 3 (weft_hash) and the 32-bit pair sort (weft_pairs) == the 64-bit radix-sort
    Stage 3: same touched passages, same scores (up to float summation order), with and without a
    filter, with and without residual scoring.
@@ -454,7 +454,7 @@ def test_graph_path(N=2500, NC=40, E=4, seed=7):
         X.set_codeword_weight(1.0)
         X.set_compact_scores(False)
         idx.set_stage1_mode(0)
-    print(f"  CUDA-graph path == eager WEFT on {same} queries (all candidates reranked), >= 90% overlap on {overlap} "
+    print(f"  CUDA-graph path == eager RAGRT on {same} queries (all candidates reranked), >= 90% overlap on {overlap} "
           f"(ndocs 256); graphs captured A={gs.stats['captures_a']} B={gs.stats['captures_b']}, replays {gs.stats['replays']}")
 
 

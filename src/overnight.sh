@@ -61,7 +61,7 @@ for st in $STEPS; do case "$st" in
         --index_dir $SCR/fastplaid_lotte_nbits4 --nbits 4 --compare v3_ablation; rm -rf $SCR/fastplaid_lotte_nbits4"
     else echo "SKIP fastplaid4: only $(free_gb) GB free (needs ~35)" | tee -a "$STATUS"; fi ;;
   msmarco_check) step msmarco_check "./run_msmarco.sh check" ;;
-  # Oct 12 queue: correlated filters + their ground truth, CUDA-graph WEFT, fast query encoder
+  # Oct 12 queue: correlated filters + their ground truth, CUDA-graph RAGRT, fast query encoder
   lotte_corr)     step lotte_corr     "./run_attribution.sh lotte v3_ablation corr" ;;
   lotte_graph)    [ $OK = 1 ] && step lotte_graph "./run_attribution.sh lotte v3_ablation graph" ;;
   msmarco_encode) step msmarco_encode "./run_attribution.sh msmarco v1 encode" ;;

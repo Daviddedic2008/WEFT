@@ -22,7 +22,7 @@ Stages (each saved to results.json, so they can be rerun independently):
   kernels, memcpys and host syncs per query (where the time goes: kernels or host overhead).
 
 Ablation engines (engines.py): ragrt_bf (no RT), ragrt_nofilter (codebook filter off),
-ragrt_centroid (no codeword score term), ragrt_ivf (plain IVF on the RAGRT kernels; needs a
+ragrt_centroid (no codeword score term), ragrt_ivf (plain IVF on the same kernels; needs a
 build_plain_ivf.py index via --sparse_csr_dir), muvera (--muvera_dir). The "attribution"
 block of each comparison lists latency ratios and paired quality differences for the
 ablation chain ptms -> ragrt_ivf -> ragrt_nofilter / ragrt_centroid -> ragrt_bf -> ragrt.
@@ -64,7 +64,7 @@ FILTER_PAIRS = [("weft", "weft_adapt"), ("weft", "weft_oracle"), ("weft_adapt", 
 DIAG_QUERIES = 200        # untimed pass per filter that logs the probed depth of filter-aware engines
 # (slow, fast, what the step from slow to fast changes); ratio = latency(slow) / latency(fast)
 ATTRIBUTION = [
-    ("ptms", "ragrt_ivf", "engine: PLAID candidate generation -> same algorithm on RAGRT kernels"),
+    ("ptms", "ragrt_ivf", "engine: PLAID candidate generation -> same algorithm on our kernels"),
     ("ragrt_ivf", "ragrt_nofilter", "subspace codeword term in the score (every list)"),
     ("ragrt_nofilter", "ragrt_bf", "codebook filter (fetch only top-eids lists)"),
     ("ragrt_centroid", "ragrt_bf", "codeword term in the score (same lists)"),
@@ -73,20 +73,20 @@ ATTRIBUTION = [
     ("ptms", "ragrt_bf", "everything except RT"),
     ("ragrt_ivf", "weft_noimpute", "native 128D fp16 centroid scores (no SVD projection)"),
     ("weft_noimpute", "weft", "missing-score imputation"),
-    ("ptms", "weft", "WEFT vs PLAID+TMS"),
-    ("ragrt", "weft", "WEFT vs the original RT design"),
-    ("muvera", "ragrt_bf", "RAGRT (no RT) vs MUVERA"),
+    ("ptms", "weft", "RAGRT vs PLAID+TMS"),
+    ("ragrt", "weft", "RAGRT vs the RT-core design"),
+    ("muvera", "ragrt_bf", "RT-core design (CUDA Stage 1) vs MUVERA"),
     ("weft", "weft_tok", "token-level postings (no per-passage dedup)"),
     ("weft_tok", "weft_resid", "residual correction (WARP implicit decompression) + rerank"),
     ("weft", "weft_resid", "residual correction overall (index + scoring)"),
     ("weft_resid", "weft_resid_norr", "drop the exact rerank"),
-    ("weft", "weft_resid_norr", "WEFT vs a WARP-style GPU pipeline (no rerank)"),
+    ("weft", "weft_resid_norr", "RAGRT vs a WARP-style GPU pipeline (no rerank)"),
     ("weft", "weft_graph", "CUDA graphs + one sync (launch and sync overhead)"),
-    ("ptms", "weft_graph", "WEFT (graphs) vs PLAID+TMS"),
+    ("ptms", "weft_graph", "RAGRT (graphs) vs PLAID+TMS"),
     ("weft", "weft_hash", "hash-table Stage 3 instead of a radix sort"),
-    ("ptms", "weft_hash", "WEFT (hash Stage 3) vs PLAID+TMS"),
+    ("ptms", "weft_hash", "RAGRT (hash Stage 3) vs PLAID+TMS"),
     ("weft", "weft_pairs", "32-bit key / 16-bit value pair sort instead of 64-bit keys"),
-    ("ptms", "weft_pairs", "WEFT (pair sort) vs PLAID+TMS"),
+    ("ptms", "weft_pairs", "RAGRT (pair sort) vs PLAID+TMS"),
 ]
 # filter_budget stage: PLAID / PLAID+TMS post-filtering with growing candidate budgets
 FILTER_BUDGETS = [{"ncells": 2, "threshold": 0.45, "ndocs": 1024}, {"ncells": 4, "threshold": 0.4, "ndocs": 4096},

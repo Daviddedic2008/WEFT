@@ -19,27 +19,27 @@ import eval_config as C
 # below 3:1 contrast on white, so every series also has its own marker, a legend and
 # direct labels, and summary.md carries the numbers as a table.
 STYLE = {
-    "ragrt": {"color": "#2a78d6", "marker": "o", "label": "RAGRT"},
+    "ragrt": {"color": "#2a78d6", "marker": "o", "label": "RT-core design"},
     "plaid": {"color": "#eb6834", "marker": "s", "label": "PLAID"},
     "ptms":  {"color": "#1baf7a", "marker": "D", "label": "PLAID+TMS"},
-    "ragrt_bf": {"color": "#eda100", "marker": "^", "label": "RAGRT, no RT (CUDA-core Stage 1)"},
-    "ragrt_nofilter": {"color": "#8c564b", "marker": "v", "label": "RAGRT, codebook filter off"},
-    "ragrt_centroid": {"color": "#7a5195", "marker": "P", "label": "RAGRT, no codeword score"},
-    "ragrt_ivf": {"color": "#5f6b6d", "marker": "X", "label": "Plain IVF on RAGRT kernels"},
+    "ragrt_bf": {"color": "#eda100", "marker": "^", "label": "RT-core design, CUDA-core Stage 1"},
+    "ragrt_nofilter": {"color": "#8c564b", "marker": "v", "label": "RT-core design, codebook filter off"},
+    "ragrt_centroid": {"color": "#7a5195", "marker": "P", "label": "RT-core design, no codeword score"},
+    "ragrt_ivf": {"color": "#5f6b6d", "marker": "X", "label": "Plain IVF on our kernels"},
     "muvera": {"color": "#c2185b", "marker": "*", "label": "MUVERA (FDE + TMS)"},
-    "weft_noimpute": {"color": "#0e7c86", "marker": "h", "label": "WEFT, no imputation"},
-    "weft": {"color": "#1b1b8f", "marker": "p", "label": "WEFT (plain IVF, native prep, imputation)"},
-    "weft_tok": {"color": "#7a5195", "marker": "<", "label": "WEFT, token-level index"},
-    "weft_resid": {"color": "#bc5090", "marker": ">", "label": "WEFT + residual correction"},
+    "weft_noimpute": {"color": "#0e7c86", "marker": "h", "label": "RAGRT, no imputation"},
+    "weft": {"color": "#1b1b8f", "marker": "p", "label": "RAGRT (plain IVF, native prep, imputation)"},
+    "weft_tok": {"color": "#7a5195", "marker": "<", "label": "RAGRT, token-level index"},
+    "weft_resid": {"color": "#bc5090", "marker": ">", "label": "RAGRT + residual correction"},
     "weft_resid_norr": {"color": "#ef5675", "marker": "d", "label": "WARP-style (residuals, no rerank)"},
-    "weft_graph": {"color": "#000060", "marker": "*", "label": "WEFT, CUDA graphs"},
-    "weft_hash": {"color": "#2f4b7c", "marker": "P", "label": "WEFT, hash Stage 3"},
-    "weft_adapt": {"color": "#665191", "marker": "X", "label": "WEFT, adaptive probing"},
-    "weft_pairs": {"color": "#003f5c", "marker": "v", "label": "WEFT, 32-bit pair sort"},
-    "weft_oracle": {"color": "#d45087", "marker": "o", "label": "WEFT, filter-aware (oracle) probing"},
-    "weft_oracle_adapt": {"color": "#a05195", "marker": "D", "label": "WEFT, oracle + adaptive probing"},
-    "weft_oimp": {"color": "#f95d6a", "marker": "^", "label": "WEFT, filter-aware imputation only"},
-    "weft_oskip": {"color": "#ff7c43", "marker": "s", "label": "WEFT, skip empty centroids only"},
+    "weft_graph": {"color": "#000060", "marker": "*", "label": "RAGRT, CUDA graphs"},
+    "weft_hash": {"color": "#2f4b7c", "marker": "P", "label": "RAGRT, hash Stage 3"},
+    "weft_adapt": {"color": "#665191", "marker": "X", "label": "RAGRT, adaptive probing"},
+    "weft_pairs": {"color": "#003f5c", "marker": "v", "label": "RAGRT, 32-bit pair sort"},
+    "weft_oracle": {"color": "#d45087", "marker": "o", "label": "RAGRT, filter-aware (oracle) probing"},
+    "weft_oracle_adapt": {"color": "#a05195", "marker": "D", "label": "RAGRT, oracle + adaptive probing"},
+    "weft_oimp": {"color": "#f95d6a", "marker": "^", "label": "RAGRT, filter-aware imputation only"},
+    "weft_oskip": {"color": "#ff7c43", "marker": "s", "label": "RAGRT, skip empty centroids only"},
 }
 ALL_ENGINES = ["plaid", "ptms", "ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf",
                "weft_noimpute", "weft", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "weft_hash", "weft_adapt", "weft_pairs",
@@ -127,19 +127,19 @@ def fig_breakdown(R, out):
         bars.append(("PLAID+TMS", [("Stages 1-3", b["ptms"]["s1_3"]), ("Stage 4 TMS", b["ptms"]["s4"])]))
     if "muvera" in b:
         bars.append(("MUVERA", [("FDE MIPS", b["muvera"]["s1_3"]), ("Stage 4 TMS", b["muvera"]["s4"])]))
-    for e, name, s1 in (("ragrt", "RAGRT", "1 RT"), ("ragrt_bf", "RAGRT no-RT", "1 brute"),
+    for e, name, s1 in (("ragrt", "RT-core design", "1 RT"), ("ragrt_bf", "RT-core, CUDA Stage 1", "1 brute"),
                         ("ragrt_nofilter", "filter off", "1 all"), ("ragrt_centroid", "no codeword score", "1 brute"),
-                        ("ragrt_ivf", "plain IVF, RAGRT kernels", "1 all"),
-                        ("weft_noimpute", "WEFT, no imputation", "1 all"), ("weft", "WEFT", "1 all"),
-                        ("weft_tok", "WEFT token index", "1 all"), ("weft_resid", "WEFT + residuals", "1 all"),
-                        ("weft_resid_norr", "WARP-style, no rerank", "1 all"), ("weft_hash", "WEFT, hash Stage 3", "1 all"),
-                        ("weft_adapt", "WEFT, adaptive", "1 all"), ("weft_pairs", "WEFT, pair sort", "1 all")):
+                        ("ragrt_ivf", "plain IVF, our kernels", "1 all"),
+                        ("weft_noimpute", "RAGRT, no imputation", "1 all"), ("weft", "RAGRT", "1 all"),
+                        ("weft_tok", "RAGRT token index", "1 all"), ("weft_resid", "RAGRT + residuals", "1 all"),
+                        ("weft_resid_norr", "WARP-style, no rerank", "1 all"), ("weft_hash", "RAGRT, hash Stage 3", "1 all"),
+                        ("weft_adapt", "RAGRT, adaptive", "1 all"), ("weft_pairs", "RAGRT, pair sort", "1 all")):
         if e in b:
             r = b[e]
             bars.append((name, [("0b prep", r["s0b_prep"]), (s1, r["s1_rt"]), ("2 gather", r["s2_gather"]),
                                 ("3 score", r["s3_score"]), ("4 TMS", r["s4_tms"])]))
     if "weft_graph" in b:          # one graph per phase: no per-stage events, total only
-        bars.append(("WEFT, CUDA graphs", [("total (graph)", b["weft_graph"]["total"])]))
+        bars.append(("RAGRT, CUDA graphs", [("total (graph)", b["weft_graph"]["total"])]))
     if not bars:
         print("  skipping fig_breakdown (no breakdown in this run)")
         return
@@ -242,9 +242,9 @@ def fig_throughput(R, out):
 def ragrt_opts_line(R):
     o = R["meta"].get("ragrt") or {}
     if not o:
-        return "- RAGRT options: (not recorded; pre-Oct-2026 run: fan geometry, dense stage 3, simt rerank)"
+        return "- RT-core design options: (not recorded; pre-Oct-2026 run: fan geometry, dense stage 3, simt rerank)"
     idx = o.get("index", {})
-    line = (f"- RAGRT: E={idx.get('num_entries', '?')}, geometry {o.get('geometry')}, stage 3 {o.get('stage3')}, "
+    line = (f"- RT-core design: E={idx.get('num_entries', '?')}, geometry {o.get('geometry')}, stage 3 {o.get('stage3')}, "
             f"rerank {o.get('rerank')} (also PLAID+TMS), index {o.get('sparse_csr_dir', '?')}")
     cal = o.get("calibration")
     if cal:
@@ -276,7 +276,7 @@ def summary_md(R, out, metric_name):
             ci = lambda m: f"{t[m]['mean']:.4f} [{t[m]['ci95'][0]:.4f}, {t[m]['ci95'][1]:.4f}]"
             L.append(f"| {name} | {STYLE[e]['label']} | {s[e]['key']} | {t['lat']['median']:.2f} | "
                      f"{t['lat']['p99']:.2f} | {ci('gt_r10')} | {ci('official')} |")
-    L += ["", "## RAGRT vs baselines at each target", "",
+    L += ["", "## RT-core design vs baselines at each target", "",
           "| target | speedup vs PLAID | speedup vs PLAID+TMS | exact R@10 diff vs PLAID+TMS | "
           f"{metric_name} diff vs PLAID+TMS | RT vs no-RT speedup | exact R@10 diff vs no-RT | "
           "vs codebook filter off: speedup | exact R@10 diff |",
@@ -330,7 +330,7 @@ def summary_md(R, out, metric_name):
             L.append(f"| {e} | {o['wall_ms']:.2f} | {o['gpu_busy_ms']:.2f} | {max(0, o['wall_ms'] - o['gpu_busy_ms']):.2f} | "
                      f"{o['kernels']:.1f} | {o['memcpys']:.1f} | {o['syncs']:.1f} |")
     if "drops" in R:
-        L += ["", "## RAGRT stage counters (diagnostic pass, counters off during timing)", "",
+        L += ["", "## RT-core design stage counters (diagnostic pass, counters off during timing)", "",
               "| config | stage-1 hits/ray | rays short of k | rays over hit cap | tasks dropped (MAX_TASKS) | "
               "MIN_BASE_SCORE drops | postings/query |",
               "|---|---|---|---|---|---|---|"]
@@ -343,7 +343,7 @@ def summary_md(R, out, metric_name):
     if os.path.exists(dpath):
         D = json.load(open(dpath))
         L += ["", f"## DRAM per query (Nsight Compute, {D['n_queries']} TEST queries, calibrated)", "",
-              "| cache mode | calibration ratio | PLAID MB/q | PLAID+TMS MB/q | RAGRT MB/q |", "|---|---|---|---|---|"]
+              "| cache mode | calibration ratio | PLAID MB/q | PLAID+TMS MB/q | RT-core MB/q |", "|---|---|---|---|---|"]
         for mode in ("none", "all"):
             m = D.get(f"cache_{mode}")
             if m:

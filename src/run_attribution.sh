@@ -5,7 +5,7 @@
 #   centroid    ragrt_centroid (no codeword score term) into BASE
 #   profile     breakdown + throughput + torch.profiler attribution for every engine in BASE
 #   ivf         build the plain-IVF index (once) and run ragrt_ivf against it -> BASE_ivf
-#   weft        WEFT (plain IVF + native fp16 prep + imputation) and its no-imputation ablation -> BASE_weft
+#   weft        RAGRT (plain IVF + native fp16 prep + imputation) and its no-imputation ablation -> BASE_weft
 #   resid       residual-correction ablation: build the token-level plain IVF (once; ~1.4x the
 #               postings + 4 B/posting token ids) and run weft_tok, weft_resid, weft_resid_norr -> BASE_resid
 #   corr        query-correlated topic filters (build_corr_filters.py; rewrites predicates.npy of the

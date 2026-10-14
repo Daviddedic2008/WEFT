@@ -5,7 +5,7 @@ WARP (XTR) baseline on LoTTE pooled dev, run inside a checkout of github.com/jls
   index   build the WARP index for lotte/pooled/dev (google/xtr-base-en, nranks=1, one GPU)
   search  for each nprobe in --nprobe: per-query latency (single query, CPU, --threads threads)
           and Success@5 on the pooled dev *search* queries, as WARP's paper reports; rankings
-          are saved so WEFT/PLAID can be compared on the same queries (qid text matched later).
+          are saved so RAGRT/PLAID can be compared on the same queries (qid text matched later).
 
 Writes <out>/warp_lotte_pooled.json.
 """

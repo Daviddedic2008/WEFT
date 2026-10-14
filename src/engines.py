@@ -3,7 +3,7 @@ The three retrieval engines behind one interface, for benchmarks and profiling.
 
   plaid  : stock ColBERTv2/PLAID (searcher.ranker.rank)
   ptms   : PLAID stages 1-3, then fused TileMaxSim rerank
-  ragrt  : RT-core candidate generation + fused TileMaxSim rerank
+  ragrt  : the RT-core design: RT-core candidate generation + fused TileMaxSim rerank
   ragrt_bf : identical pipeline, but Stage 1 runs on CUDA cores: the no-RT ablation.
   ragrt_nofilter : codebook-filter ablation: Stage 1 returns every codeword, so Stage 2
              fetches every list of each probed centroid (plain centroid probing on the same
@@ -17,7 +17,8 @@ The three retrieval engines behind one interface, for benchmarks and profiling.
              plain-IVF index (build_plain_ivf.py: one list per centroid, deduplicated pids),
              so it is PLAID's candidate generation (centroid interaction) run on RAGRT's
              kernels. ptms vs this isolates the engine; this vs ragrt_bf isolates the codebooks.
-  weft     : the plain-IVF engine with the two cheap improvements: Stage 0b centroid scores from
+  weft     : the main RAGRT engine (ids weft_* kept from earlier runs so stored results stay comparable):
+             the plain-IVF engine with the two cheap improvements: Stage 0b centroid scores from
              one fp16 GEMM in the native 128 dimensions (no SVD projection), and WARP-style
              missing-score imputation (weft_prep.py). Run on a build_plain_ivf.py index.
   weft_noimpute : weft without the imputation (isolates it; ragrt_ivf vs this isolates the prep).
@@ -92,7 +93,7 @@ def ragrt_cfg_key(p):
     return f"nc={p['nc']} eids={p['eids']} ndocs={p['ndocs']}"
 
 
-WEFT_ENGINES = ("weft", "weft_noimpute", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "weft_hash",
+IVF_ENGINES = ("weft", "weft_noimpute", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "weft_hash",
                 "weft_adapt", "weft_pairs", "weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip")
 HASH_ENGINES = ("weft_hash",)
 PAIRS_ENGINES = ("weft_pairs",)
@@ -105,11 +106,11 @@ ADAPT_SLACK = 0.5                        # token is starved below this share of 
 GRAPH_ENGINES = ("weft_graph",)          # CUDA-graph path: no per-stage profile, no batched pipeline
 RESID_ENGINES = ("weft_resid", "weft_resid_norr")       # need a token-level index (csr_token_ids.npy)
 TOKEN_ENGINES = ("weft_tok",) + RESID_ENGINES
-RAGRT_ENGINES = ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf") + WEFT_ENGINES
+RAGRT_ENGINES = ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf") + IVF_ENGINES
 STAGE1_MODE = {"ragrt": 0, "ragrt_bf": 1, "ragrt_nofilter": 2,      # see CorrIndex3D.set_stage1_mode
-               "ragrt_centroid": 1, "ragrt_ivf": 2, **{e: 2 for e in WEFT_ENGINES}}
+               "ragrt_centroid": 1, "ragrt_ivf": 2, **{e: 2 for e in IVF_ENGINES}}
 CODEWORD_WEIGHT = {"ragrt": 1.0, "ragrt_bf": 1.0, "ragrt_nofilter": 1.0,   # weight of q_s.w in Stage 2
-                   "ragrt_centroid": 0.0, "ragrt_ivf": 0.0, **{e: 0.0 for e in WEFT_ENGINES}}
+                   "ragrt_centroid": 0.0, "ragrt_ivf": 0.0, **{e: 0.0 for e in IVF_ENGINES}}
 # Stage 0b: "svd96" = centroid scores in the 96D SVD space (codebook engines); "native" = fp16 GEMM
 # against the 128D ColBERT centroids; impute = missing-score imputation; compact = scores [ntok, nc]
 # aligned with topc instead of [ntok, num_centroids] (weft_prep.py; identical results).
@@ -363,7 +364,7 @@ class Engines:
         (scores in the 96D SVD space, or native 128D fp16 with optional imputation: self.prep_mode)."""
         mode, impute, compact, resid = self.prep_mode
         if mode == "native":
-            # WEFT engines: Stage 1 is "every codeword" with codeword weight 0, so the 3D sub-queries
+            # RAGRT engines: Stage 1 is "every codeword" with codeword weight 0, so the 3D sub-queries
             # are never used; skip the 128 -> 96 projection (zeros of the right shape).
             if self.zero_sub is None:
                 self.zero_sub = torch.zeros(32, L.NUM_SUBSPACES, L.SUBSPACE_DIM, device="cuda")

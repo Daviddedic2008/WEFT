@@ -1,4 +1,4 @@
-# RAGRT: Late‑Interaction Retrieval with RT‑Accelerated Candidate Generation
+# RAGRT: GPU Late‑Interaction Retrieval
 
 ## Evaluation pipeline (`src/`)
 
@@ -9,20 +9,20 @@
 
 Paths live in `eval_config.py`. CPU tests: `tests/test_index_lib.py`, `tests/test_eval_lib.py`, `tests/test_harness_smoke.py`, `tests/test_builder_cpu.py`, `tests/test_ablation_cpu.py`. GPU tests (after building): `tests/test_gpu_kernels.py`, `tests/test_stage1_gpu.py`.
 
-## Main engine: WEFT (plain IVF on the RAGRT kernels)
+## Main engine (plain IVF, engine id `weft`)
 
-The ablations showed the RT core and the subspace codebooks both cost time: plain IVF on the same Stage 2/3/4 kernels is faster at every recall target and needs 0.56 GB of lists instead of about 8 GB (LoTTE). `weft` = that engine plus native 128D fp16 centroid scores and missing-score imputation (`weft_prep.py`), on an index from `build_plain_ivf.py`. Run: `run_attribution.sh <dataset> <base> weft`; MS MARCO: `run_msmarco.sh`. The codebook and RT engines stay for the negative-result section.
+The ablations showed the RT core and the subspace codebooks both cost time: plain IVF on the same Stage 2/3/4 kernels is faster at every recall target and needs 0.56 GB of lists instead of about 8 GB (LoTTE). The main RAGRT engine is that pipeline plus native 128D fp16 centroid scores and missing-score imputation (`weft_prep.py`), on an index from `build_plain_ivf.py`. Its engine ids (`weft`, `weft_*`) are kept from earlier runs so stored results stay comparable. Run: `run_attribution.sh <dataset> <base> weft`; MS MARCO: `run_msmarco.sh`. The codebook and RT engines stay for the negative-result section.
 
-## RAGRT stages and options
+## RT-core design: stages and options
 
 - Stage 1 (`--geometry`): `polar` (default) puts codeword c on the plane x·c = 1 (one triangle per codeword); a ray from the origin along the unit query slice d hits it at t = 1/(d·c), so tmax = 1/τ returns exactly the codewords with d·c ≥ τ. τ is calibrated per subspace and per k level on TUNE queries (`--rt_quantile`). `fan` is the original scene (hits about every codeword with d·c > 0; RT acts as a half-space filter).
 - Codebook size E is set at training time (`train_codebooks.py --num_entries E`, GPU k-means); eids are 8-bit up to E=256 and 16-bit beyond.
 - Stage 3 (`--stage3`): `sparse` (default) radix-sorts only the touched postings; `dense` uses an ntok × N table.
 - Stage 4 (`--rerank`): `wmma` (default) tensor-core TileMaxSim; `simt` is the original kernel. PLAID+TMS uses the same kernel.
 - No-RT ablation: engine `ragrt_bf` runs Stage 1 on CUDA cores with identical output (polar: the same threshold as a linear scan; fan: exact top-k).
-- Other ablations (`engines.py`): `ragrt_nofilter` (every codeword, so every list of a probed centroid), `ragrt_centroid` (same lists as `ragrt_bf`, postings scored q·c without the codeword term; `set_codeword_weight`), `ragrt_ivf` (plain IVF on RAGRT's kernels, needs a `build_plain_ivf.py` index), `muvera` (MUVERA FDEs from `build_muvera_fde.py`, exact GPU inner product, same rerank).
+- Other ablations (`engines.py`): `ragrt_nofilter` (every codeword, so every list of a probed centroid), `ragrt_centroid` (same lists as `ragrt_bf`, postings scored q·c without the codeword term; `set_codeword_weight`), `ragrt_ivf` (plain IVF on the same kernels, needs a `build_plain_ivf.py` index), `muvera` (MUVERA FDEs from `build_muvera_fde.py`, exact GPU inner product, same rerank).
 
-Attribution: `run_attribution.sh <dataset> <base results subdir> [centroid profile ivf muvera]` runs the ablations against a main run; `summary.md` gets an attribution-chain table (PLAID+TMS → plain IVF on RAGRT kernels → codeword score / codebook filter → RT) and a torch.profiler table (wall vs GPU-busy time, kernels, memcpys, host syncs per query). FastPLAID: `export_embeddings.py`, then `bench_fastplaid.py` in its own venv. MS MARCO end to end: `run_msmarco.sh`.
+Attribution: `run_attribution.sh <dataset> <base results subdir> [centroid profile ivf muvera]` runs the ablations against a main run; `summary.md` gets an attribution-chain table (PLAID+TMS → plain IVF on the same kernels → codeword score / codebook filter → RT) and a torch.profiler table (wall vs GPU-busy time, kernels, memcpys, host syncs per query). FastPLAID: `export_embeddings.py`, then `bench_fastplaid.py` in its own venv. MS MARCO end to end: `run_msmarco.sh`.
 
 Diagnostics: `diag_stage1.py` (recall of the exact top-k codewords per ray, hits per ray, Stage-1 time per variant), `diag_pca_filter.py`.
 

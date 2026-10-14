@@ -1,7 +1,7 @@
 """
-CUDA-graph execution of the WEFT pipeline (engine weft_graph in engines.py).
+CUDA-graph execution of the RAGRT pipeline (engine weft_graph in engines.py).
 
-Eager WEFT launches ~60 kernels per query from Python and synchronizes twice inside sparse
+Eager RAGRT launches ~60 kernels per query from Python and synchronizes twice inside sparse
 Stage 3 (to size the sort, then to size the reduce output), so on LoTTE the GPU is busy for only
 ~0.44 of the ~0.65 ms wall time. Here a query is two CUDA graph replays and one sync:
 

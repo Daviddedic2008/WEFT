@@ -5,7 +5,7 @@ Reports, on the first --n evaluation queries:
   latency    per-query median (ms) of stock, fast without graphs, fast with CUDA graphs
   batched    queries/s encoding --batch queries at once, stock vs fast (graphs)
   agreement  per-token cosine between the two encodings; ntok agreement
-  retrieval  (with --sparse_csr_dir <plain IVF index>) top-10 / top-100 overlap of WEFT results
+  retrieval  (with --sparse_csr_dir <plain IVF index>) top-10 / top-100 overlap of RAGRT results
              from the two encodings, and recall@10 of each against the exact ground truth
 
   python3 bench_encode.py --dataset lotte --sparse_csr_dir /local/scratch/a/cashman3/lotte_plain_ivf
@@ -37,7 +37,7 @@ def main():
     ap.add_argument("--dataset", required=True, choices=list(C.DATASETS))
     ap.add_argument("--n", type=int, default=500)
     ap.add_argument("--batch", type=int, default=32)
-    ap.add_argument("--sparse_csr_dir", default=None, help="plain-IVF index: also compare WEFT results")
+    ap.add_argument("--sparse_csr_dir", default=None, help="plain-IVF index: also compare RAGRT results")
     ap.add_argument("--nc", type=int, default=32)
     ap.add_argument("--ndocs", type=int, default=4096)
     args = ap.parse_args()
