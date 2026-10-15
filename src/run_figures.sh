@@ -29,8 +29,9 @@ if nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -q .; then
 fi
 
 ENGINES=plaid,ptms,weft,weft_adapt
-# filter-aware variants reuse weft / weft_adapt's selected params (PARAMS_FROM), so they run in the filtered stage only
-ORACLE=weft_oracle,weft_oracle_adapt,weft_oimp,weft_oskip
+# filter-aware variants (ours, and PLAID / PLAID+TMS with the filter on Stage 1 as ColBERT's filter_fn does) reuse
+# their parent's selected params (PARAMS_FROM), so they run in the filtered stage only
+ORACLE=weft_oracle,weft_oracle_adapt,weft_oimp,weft_oskip,plaid_fn,ptms_fn
 MUV_ARGS=""
 if [ -f "$MUV_DIR/fde_docs_fp16.npy" ]; then ENGINES="$ENGINES,muvera"; MUV_ARGS="--muvera_dir $MUV_DIR"
 else echo "note: no MUVERA FDEs at $MUV_DIR; MUVERA left out of this run"; fi

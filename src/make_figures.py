@@ -27,6 +27,8 @@ INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 STYLE = {
     "plaid":     ("#c0392b", "s", "PLAID"),
     "ptms":      ("#e67e22", "D", "PLAID+TMS"),
+    "plaid_fn":  ("#922b21", "s", "PLAID, filter on Stage 1"),
+    "ptms_fn":   ("#a04000", "D", "PLAID+TMS, filter on Stage 1"),
     "fastplaid": ("#8e44ad", "^", "FastPLAID"),
     "muvera":    ("#c2185b", "*", "MUVERA (FDE + TMS)"),
     "warp":      ("#16a085", "v", "WARP (XTR, CPU)"),
@@ -75,7 +77,8 @@ class Results:
             raise SystemExit(f"FATAL: no results.json in {os.path.join(root, a.main)}")
         self.target = a.target or self.M["primary_target"]
         self.metric = ds["official_metric"]
-        self.ids = {"plaid": "plaid", "ptms": "ptms", "ragrt": "ragrt", "ours": a.ours,
+        self.ids = {"plaid": "plaid", "ptms": "ptms", "plaid_fn": "plaid_fn", "ptms_fn": "ptms_fn",
+                    "ragrt": "ragrt", "ours": a.ours,
                     "ours_adapt": "weft_adapt", "ours_oracle": "weft_oracle_adapt", "muvera": "muvera"}
         mu = None if a.muvera == "none" else (a.muvera or newest(os.path.join(root, "*_muvera", "results.json")))
         self.MU = jload(mu if mu and mu.endswith(".json") else os.path.join(mu, "results.json") if mu else None)
@@ -314,7 +317,7 @@ def fig_filters(X, out, md):
     filts = [f for f in FILTER_ORDER if f in F]
     if not filts:
         return
-    names = [n for n in ["plaid", "ptms", "fastplaid", "ragrt", "ours", "ours_adapt", "ours_oracle"]
+    names = [n for n in ["plaid", "ptms", "plaid_fn", "ptms_fn", "fastplaid", "ragrt", "ours", "ours_adapt", "ours_oracle"]
              if (n != "ragrt" or X.show_rt) and any(X.filtered(n, f) for f in filts)]
     fig, axes = plt.subplots(2, 1, figsize=(12, 6.2), layout="constrained", sharex=True)
     w = 0.8 / len(names)
@@ -350,7 +353,7 @@ def fig_selectivity(X, out, md):
     if not syn:
         return
     fig, axes = plt.subplots(1, 2, figsize=(10, 3.4), layout="constrained")
-    for n in ["plaid", "ptms", "fastplaid", "ragrt", "ours", "ours_adapt"]:
+    for n in ["plaid", "ptms", "plaid_fn", "ptms_fn", "fastplaid", "ragrt", "ours", "ours_adapt"]:
         if n == "ragrt" and not X.show_rt:
             continue
         unf = X.point(n)
@@ -381,12 +384,13 @@ def fig_budget(X, out, md):
     fig, axes = plt.subplots(1, len(filts), figsize=(4.2 * len(filts), 3.4), layout="constrained", squeeze=False)
     md.append("## fig7: post-filter budget sweep (R@10 at ms)\n")
     for ax, f in zip(axes[0], filts):
-        for e in ("plaid", "ptms"):
+        for e in ("plaid", "ptms", "plaid_fn", "ptms_fn"):
             if e not in B[f]:
                 continue
             pts = sorted(B[f][e].values(), key=lambda v: v["params"]["ndocs"])
             ax.plot([p["lat"]["median"] for p in pts], [val(p["gt_r10"]) for p in pts], color=STYLE[e][0],
-                    marker=STYLE[e][1], label=f"{STYLE[e][2]}, 1x to 64x candidates")
+                    marker=STYLE[e][1], linestyle="--" if e.endswith("_fn") else "-",
+                    label=f"{STYLE[e][2]}, 1x to 64x candidates")
             md.append(f"- {f} {STYLE[e][2]}: " + ", ".join(f"{val(p['gt_r10']):.3f} at {p['lat']['median']:.1f}" for p in pts))
         for n in ("ours", "ours_adapt", "ours_oracle"):
             s = X.filtered(n, f)

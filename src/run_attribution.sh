@@ -16,6 +16,8 @@
 #               filters), filtered stage, and PLAID / PLAID+TMS post-filter budget sweep -> BASE_tue
 #   wed         weft (re-run) vs weft_pairs (32-bit pair-sort Stage 3) and the revised weft_adapt
 #               (8x cap, 75th-percentile token, cached per-filter counts, fast path) -> BASE_wed
+#   plaidfn     PLAID / PLAID+TMS with the filter on Stage 1 (ColBERT filter_fn) vs post-filter and RAGRT,
+#               filtered + budget stages on top of the newest figs_* run -> <figs run>_plaidfn
 #   encode      stage 0a: stock ColBERT query encoder vs fast_encoder.py (bench_encode.py)
 #   muvera      build MUVERA FDEs (once; needs export_embeddings.py output) and run muvera -> BASE_muvera
 # Disk: plain IVF ~ 3 B x (deduplicated postings), MUVERA 2560 dims ~ 12.4 GB on LoTTE.
@@ -128,6 +130,17 @@ for st in $STEPS; do
           --core plaid,ptms,weft --engines weft_oracle,weft_oracle_adapt,weft_oimp,weft_oskip --filtered_extra weft,weft_adapt \
           --stages select,filtered
       python3 plot_results.py --dataset "$DATASET" --results_subdir "${BASE}_oracle2" ;;
+    plaidfn)   # PLAID / PLAID+TMS with the filter on the Stage 1 candidates (ColBERT filter_fn) vs post-filter and
+               # RAGRT, all re-measured in one run on top of the newest figs_* run (its sweeps and selection)
+      PREV=$(ls -dt "$ROOT"/figs_* 2>/dev/null | grep -v _plaidfn | head -1)
+      [ -n "$PREV" ] && [ -f "$PREV/results.json" ] || { echo "run run_figures.sh $DATASET first"; exit 1; }
+      OUTN="$(basename "$PREV")_plaidfn"
+      python3 run_benchmarks.py --dataset "$DATASET" --results_subdir "$OUTN" --sparse_csr_dir "$IVF_DIR" \
+          --baseline_from "$PREV" --import_engines plaid,ptms,weft,weft_adapt,muvera \
+          --core plaid,ptms,weft --engines plaid_fn,ptms_fn,weft_adapt,weft_oracle_adapt \
+          --filtered_extra plaid,ptms,weft --stages select,filtered,filter_budget
+      python3 plot_results.py --dataset "$DATASET" --results_subdir "$OUTN"
+      python3 make_figures.py --dataset "$DATASET" --main "$OUTN" ;;
     encode)
       python3 bench_encode.py --dataset "$DATASET" --sparse_csr_dir "$IVF_DIR" ;;
     muvera)

@@ -22,6 +22,8 @@ STYLE = {
     "ragrt": {"color": "#2a78d6", "marker": "o", "label": "RT-core design"},
     "plaid": {"color": "#eb6834", "marker": "s", "label": "PLAID"},
     "ptms":  {"color": "#1baf7a", "marker": "D", "label": "PLAID+TMS"},
+    "plaid_fn": {"color": "#b5532a", "marker": "s", "label": "PLAID, filter on Stage 1 (filter_fn)"},
+    "ptms_fn": {"color": "#127a55", "marker": "D", "label": "PLAID+TMS, filter on Stage 1"},
     "ragrt_bf": {"color": "#eda100", "marker": "^", "label": "RT-core design, CUDA-core Stage 1"},
     "ragrt_nofilter": {"color": "#8c564b", "marker": "v", "label": "RT-core design, codebook filter off"},
     "ragrt_centroid": {"color": "#7a5195", "marker": "P", "label": "RT-core design, no codeword score"},
@@ -41,7 +43,7 @@ STYLE = {
     "weft_oimp": {"color": "#f95d6a", "marker": "^", "label": "RAGRT, filter-aware imputation only"},
     "weft_oskip": {"color": "#ff7c43", "marker": "s", "label": "RAGRT, skip empty centroids only"},
 }
-ALL_ENGINES = ["plaid", "ptms", "ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf",
+ALL_ENGINES = ["plaid", "ptms", "plaid_fn", "ptms_fn", "ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf",
                "weft_noimpute", "weft", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "weft_hash", "weft_adapt", "weft_pairs",
                "weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip", "muvera"]
 ENGINES = ALL_ENGINES          # narrowed in main() to the engines present in results.json

@@ -55,12 +55,15 @@ CORE = ["plaid", "ptms", "ragrt"]          # the primary operating point must be
 # ablations: no-RT Stage 1; codebook filter off; no codeword score; plain IVF on RAGRT kernels; MUVERA
 ENGINES = CORE + ["ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft_noimpute", "weft",
                   "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph",
-                  "weft_hash", "weft_adapt", "weft_pairs", "weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip", "muvera"]
+                  "weft_hash", "weft_adapt", "weft_pairs", "weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip", "muvera",
+                  "plaid_fn", "ptms_fn"]
 # engines identical to another when unfiltered: the filtered stage runs them at that engine's selected config
-PARAMS_FROM = {"weft_oracle": "weft", "weft_oracle_adapt": "weft_adapt", "weft_oimp": "weft", "weft_oskip": "weft"}
+PARAMS_FROM = {"plaid_fn": "plaid", "ptms_fn": "ptms", "weft_oracle": "weft", "weft_oracle_adapt": "weft_adapt", "weft_oimp": "weft", "weft_oskip": "weft"}
 # filtered stage: paired recall@10 differences (b - a, same queries) for these (a, b) when both ran in this run
 FILTER_PAIRS = [("weft", "weft_adapt"), ("weft", "weft_oracle"), ("weft_adapt", "weft_oracle_adapt"),
-                ("weft", "weft_oimp"), ("weft", "weft_oskip")]
+                ("weft", "weft_oimp"), ("weft", "weft_oskip"),
+                ("plaid", "plaid_fn"), ("ptms", "ptms_fn"), ("ptms_fn", "weft"), ("ptms_fn", "weft_adapt"),
+                ("ptms_fn", "weft_oracle_adapt")]
 DIAG_QUERIES = 200        # untimed pass per filter that logs the probed depth of filter-aware engines
 # (slow, fast, what the step from slow to fast changes); ratio = latency(slow) / latency(fast)
 ATTRIBUTION = [
@@ -278,6 +281,8 @@ class Bench:
             grids["plaid"] = grids["plaid"] + [PLAID_DEFAULT_K100]
         sweep = self.R.setdefault("sweep", {})
         for engine in self.engines:
+            if engine in PARAMS_FROM:          # same as its parent unfiltered; uses the parent's sweep
+                continue
             pts = []
             t0 = time.time()
             for i, p in enumerate(grids[engine]):
@@ -525,12 +530,13 @@ class Bench:
 
     def stage_filter_budget(self):
         """Can post-filtering catch up with a bigger candidate budget, and at what latency? PLAID and
-        PLAID+TMS at FILTER_BUDGETS on the hard filters (default corr_mid, corr_far, syn5)."""
+        PLAID+TMS at FILTER_BUDGETS on the hard filters (default corr_mid, corr_far, syn5), both with the
+        filter after ranking (plaid, ptms) and on the Stage 1 candidates (plaid_fn, ptms_fn)."""
         filts = self.args.filters or [f for f in ("corr_mid", "corr_far", "syn5") if f in self.gt_names]
         qids = self.test[:self.args.budget_queries]
         out = self.R.setdefault("filter_budget", {})
         for f in filts:
-            for e in ("plaid", "ptms"):
+            for e in ("plaid", "ptms", "plaid_fn", "ptms_fn"):
                 for b in FILTER_BUDGETS:
                     res = self.evaluate(e, b, qids, filt=f)
                     k = f"nc={b['ncells']} th={b['threshold']} ndocs={b['ndocs']}"

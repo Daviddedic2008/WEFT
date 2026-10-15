@@ -1,7 +1,8 @@
 """
 The three retrieval engines behind one interface, for benchmarks and profiling.
 
-  plaid  : stock ColBERTv2/PLAID (searcher.ranker.rank)
+  plaid  : stock ColBERTv2/PLAID (searcher.ranker.rank); filters applied to the final ranking
+  plaid_fn / ptms_fn : PLAID / PLAID+TMS with the filter on the Stage 1 candidates (ColBERT's filter_fn)
   ptms   : PLAID stages 1-3, then fused TileMaxSim rerank
   ragrt  : the RT-core design: RT-core candidate generation + fused TileMaxSim rerank
   ragrt_bf : identical pipeline, but Stage 1 runs on CUDA cores: the no-RT ablation.
@@ -333,16 +334,52 @@ class Engines:
     # ------------------------------------------------------------ PLAID
     @torch.no_grad()
     def plaid(self, Qf, p, mask=0):
-        """Stock PLAID; a filter can only be applied after ranking (post-filter)."""
+        """Stock PLAID, filter applied to its final ranking (post-filter)."""
         self.set_plaid(p)
         pids, _ = self.ranker.rank(self.searcher.config, Qf.unsqueeze(0))
         pids = pids.tolist() if torch.is_tensor(pids) else list(pids)
         return self.passes(pids, mask)[:C.TOP_K]
 
+    def pid_filter(self, mask):
+        """ColBERT-style filter_fn: keep the candidate pids whose predicate bits match the mask."""
+        def f(pids):
+            return pids[(self.pred_gpu[pids.long()] & mask) != 0]
+        return f
+
     @torch.no_grad()
-    def plaid_stage3(self, Qf, p):
+    def plaid_fn(self, Qf, p, mask=0):
+        """Stock PLAID with ColBERT's own filter_fn: the filter is applied to the Stage 1 candidates,
+        before centroid interaction and the ndocs cuts (IndexScorer.rank, colbert-ai >= 0.2.16).
+        Same steps as rank(..., filter_fn=f), written out so it does not depend on the installed version."""
         self.set_plaid(p)
-        return get_stage3_pids(self.ranker, self.searcher.config, Qf.unsqueeze(0))
+        cfg, Q = self.searcher.config, Qf.unsqueeze(0)
+        pids, centroid_scores = self.ranker.retrieve(cfg, Q)
+        if not torch.is_tensor(pids):
+            pids = torch.tensor(pids, dtype=torch.int32, device="cuda")
+        if mask:
+            pids = self.pid_filter(mask)(pids)
+        if pids.numel() == 0:
+            return []
+        scores, pids = self.ranker.score_pids(cfg, Q, pids, centroid_scores)
+        order = scores.sort(descending=True).indices
+        return pids[order].tolist()[:C.TOP_K]
+
+    @torch.no_grad()
+    def plaid_stage3(self, Qf, p, mask=0):
+        self.set_plaid(p)
+        return get_stage3_pids(self.ranker, self.searcher.config, Qf.unsqueeze(0),
+                               self.pid_filter(mask) if mask else None)
+
+    @torch.no_grad()
+    def ptms_fn(self, Qf, p, mask=0):
+        """PLAID+TMS with the filter applied to the Stage 1 candidates (as plaid_fn), then
+        stages 2-3 and the fused TileMaxSim rerank over passing passages only."""
+        cands = self.plaid_stage3(Qf, p, mask)
+        if cands.numel() == 0:
+            return []
+        cands = cands.to(torch.int32).contiguous()
+        s = self.tms_scores(Qf, cands)
+        return cands[torch.topk(s, min(C.TOP_K, cands.numel())).indices].tolist()
 
     @torch.no_grad()
     def ptms(self, Qf, p, mask=0):
@@ -605,6 +642,10 @@ class Engines:
             return self.plaid(Qf, p, mask)
         if engine == "ptms":
             return self.ptms(Qf, p, mask)
+        if engine == "plaid_fn":
+            return self.plaid_fn(Qf, p, mask)
+        if engine == "ptms_fn":
+            return self.ptms_fn(Qf, p, mask)
         if engine in RAGRT_ENGINES:
             self.use_engine(engine)
             try:
@@ -618,7 +659,7 @@ class Engines:
         raise ValueError(engine)
 
 
-def get_stage3_pids(ranker, config, Q):
+def get_stage3_pids(ranker, config, Q, pid_filter=None):
     """
     PLAID stages 1-3, the same steps as ColBERT's IndexScorer.score_pids (GPU path):
     candidate generation, pruned centroid interaction -> top ndocs, full centroid
@@ -629,6 +670,10 @@ def get_stage3_pids(ranker, config, Q):
         pids, centroid_scores = ranker.retrieve(config, Q)
         if isinstance(pids, list):
             pids = torch.tensor(pids, dtype=torch.int32, device="cuda")
+        if pid_filter is not None:              # ColBERT filter_fn position: right after Stage 1
+            pids = pid_filter(pids)
+            if pids.numel() == 0:
+                return pids
         batch_size = 2 ** 20
         if centroid_scores is not None and ranker.use_gpu:
             centroid_scores = centroid_scores.cuda()
