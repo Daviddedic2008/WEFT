@@ -340,7 +340,8 @@ def fig_filters(X, out, md):
     axes[0].set_ylabel("Recall of exact filtered top-10"); axes[0].set_ylim(0, 1.02)
     axes[1].set_ylabel("Median latency (ms)"); axes[1].set_yscale("log")
     axes[1].set_xticks(range(len(filts))); axes[1].set_xticklabels([FILTER_LABEL.get(f, f) for f in filts])
-    fig.legend(*axes[0].get_legend_handles_labels(), ncol=len(names), fontsize=7, loc="outside upper center")
+    fig.legend(*axes[0].get_legend_handles_labels(), ncol=min(len(names), 5), fontsize=7, loc="lower center",
+               bbox_to_anchor=(0.5, 1.0))           # above the panels; works on older matplotlib too
     for ax in axes:
         ax.grid(axis="x", visible=False)
     save(fig, out, "fig5_filters.png")

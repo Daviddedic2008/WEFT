@@ -154,5 +154,7 @@ for st in $STEPS; do
     *) echo "unknown step $st"; exit 1 ;;
   esac
 done
-python3 plot_results.py --dataset "$DATASET" --results_subdir "$BASE"
-echo "Attribution tables: $ROOT/$BASE*/summary.md"
+if [ -f "$ROOT/$BASE/results.json" ]; then           # steps like plaidfn take a placeholder BASE
+  python3 plot_results.py --dataset "$DATASET" --results_subdir "$BASE"
+  echo "Attribution tables: $ROOT/$BASE*/summary.md"
+fi
