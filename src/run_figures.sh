@@ -5,7 +5,8 @@
 #   ./run_figures.sh msmarco
 # Steps:
 #   1. run_benchmarks.py -> <results>/<ds>/figs_<date>: PLAID, PLAID+TMS, RAGRT (weft) and its filter
-#      variants (adaptive; filter-aware and its two ablation halves in the filtered stage), plus MUVERA if its FDEs exist.
+#      variants (adaptive; filter-aware and its two ablation halves in the filtered stage), RAGRT with the
+#      pid-only sort Stage 3 (weft_pidsort), plus MUVERA if its FDEs exist.
 #      Stages: sweep, select, test, breakdown, throughput, attribution, filtered, filter_budget.
 #   2. FastPLAID (own venv) re-measured with --compare figs_<date>, if its index and the exported
 #      embeddings exist; otherwise skipped and make_figures marks the old FastPLAID results as stale.
@@ -28,7 +29,7 @@ if nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -q .; then
   echo "FATAL: another process is using the GPU; timings would be wrong"; nvidia-smi; exit 1
 fi
 
-ENGINES=plaid,ptms,weft,weft_adapt
+ENGINES=plaid,ptms,weft,weft_adapt,weft_pidsort
 # filter-aware variants (ours, and PLAID / PLAID+TMS with the filter on Stage 1 as ColBERT's filter_fn does) reuse
 # their parent's selected params (PARAMS_FROM), so they run in the filtered stage only
 ORACLE=weft_oracle,weft_oracle_adapt,weft_oimp,weft_oskip,plaid_fn,ptms_fn

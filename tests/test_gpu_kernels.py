@@ -14,9 +14,9 @@ GPU tests (run on the server after building the extension and the PTX):
    compact scores == full scores; LUT off == centroid-only scores.
 6. CUDA-graph path (graph_search.py, engine weft_graph) returns the same results as the eager
    RAGRT path, with and without a filter, across graph re-use and capacity buckets.
-7. Hash-table Stage 3 (weft_hash) and the 32-bit pair sort (weft_pairs) == the 64-bit radix-sort
-   Stage 3: same touched passages, same scores (up to float summation order), with and without a
-   filter, with and without residual scoring.
+7. Hash-table Stage 3 (weft_hash), the 32-bit pair sort (weft_pairs) and the pid-only sort
+   (weft_pidsort) == the 64-bit radix-sort Stage 3: same touched passages, same scores (up to float
+   summation order), with and without a filter, with and without residual scoring.
 """
 import os, sys
 import numpy as np
@@ -494,13 +494,13 @@ def test_hash_stage3(N=3000, NC=40, E=4, seed=11):
                 topc, sc, _ = native_prep(Qf, C128, nc, impute=True, compact=True)
                 idx.set_residual_lut(residual_lut(Qf, bw, rbm, dt) if tokens else torch.empty(0))
                 out = {}
-                for mode in (0, 1, 2):
+                for mode in (0, 1, 2, 3):
                     X.set_stage3_mode(mode)
                     p, a = idx.candidates(torch.zeros(nq, S, 3, device=dev), topc, sc, nc, N, mask, E)
                     p, a = p.cpu().numpy(), a.cpu().numpy()
                     keep = p >= 0
                     out[mode] = dict(zip(p[keep].tolist(), a[keep].tolist()))
-                for mode in (1, 2):
+                for mode in (1, 2, 3):
                     assert set(out[0]) == set(out[mode]), (mode, tokens, trial, len(out[0]), len(out[mode]))
                     d = max((abs(out[0][k] - out[mode][k]) for k in out[0]), default=0.0)
                     assert d < 1e-4 * nq, (mode, tokens, trial, d)
@@ -511,7 +511,7 @@ def test_hash_stage3(N=3000, NC=40, E=4, seed=11):
             X.set_stage3_mode(0); X.set_codeword_weight(1.0); X.set_compact_scores(False)
             idx.set_residual_lut(torch.empty(0)); idx.set_stage1_mode(0)
     assert X.get_stage3_mode() == 0
-    print(f"  hash-table and 32-bit pair-sort Stage 3 == 64-bit radix-sort Stage 3 on {checked} queries "
+    print(f"  hash-table, 32-bit pair-sort and pid-only-sort Stage 3 == 64-bit radix-sort Stage 3 on {checked} queries "
           f"(dedup + token-level/residual, with/without filter)")
 
 

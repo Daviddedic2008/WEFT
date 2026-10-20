@@ -38,13 +38,14 @@ STYLE = {
     "weft_hash": {"color": "#2f4b7c", "marker": "P", "label": "RAGRT, hash Stage 3"},
     "weft_adapt": {"color": "#665191", "marker": "X", "label": "RAGRT, adaptive probing"},
     "weft_pairs": {"color": "#003f5c", "marker": "v", "label": "RAGRT, 32-bit pair sort"},
+    "weft_pidsort": {"color": "#2c7fb8", "marker": "8", "label": "RAGRT, pid-only sort Stage 3"},
     "weft_oracle": {"color": "#d45087", "marker": "o", "label": "RAGRT, filter-aware (oracle) probing"},
     "weft_oracle_adapt": {"color": "#a05195", "marker": "D", "label": "RAGRT, oracle + adaptive probing"},
     "weft_oimp": {"color": "#f95d6a", "marker": "^", "label": "RAGRT, filter-aware imputation only"},
     "weft_oskip": {"color": "#ff7c43", "marker": "s", "label": "RAGRT, skip empty centroids only"},
 }
 ALL_ENGINES = ["plaid", "ptms", "plaid_fn", "ptms_fn", "ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf",
-               "weft_noimpute", "weft", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "weft_hash", "weft_adapt", "weft_pairs",
+               "weft_noimpute", "weft", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "weft_hash", "weft_adapt", "weft_pairs", "weft_pidsort",
                "weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip", "muvera"]
 ENGINES = ALL_ENGINES          # narrowed in main() to the engines present in results.json
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
@@ -135,7 +136,8 @@ def fig_breakdown(R, out):
                         ("weft_noimpute", "RAGRT, no imputation", "1 all"), ("weft", "RAGRT", "1 all"),
                         ("weft_tok", "RAGRT token index", "1 all"), ("weft_resid", "RAGRT + residuals", "1 all"),
                         ("weft_resid_norr", "WARP-style, no rerank", "1 all"), ("weft_hash", "RAGRT, hash Stage 3", "1 all"),
-                        ("weft_adapt", "RAGRT, adaptive", "1 all"), ("weft_pairs", "RAGRT, pair sort", "1 all")):
+                        ("weft_adapt", "RAGRT, adaptive", "1 all"), ("weft_pairs", "RAGRT, pair sort", "1 all"),
+                        ("weft_pidsort", "RAGRT, pid sort", "1 all")):
         if e in b:
             r = b[e]
             bars.append((name, [("0b prep", r["s0b_prep"]), (s1, r["s1_rt"]), ("2 gather", r["s2_gather"]),

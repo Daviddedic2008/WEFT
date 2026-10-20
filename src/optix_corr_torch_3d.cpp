@@ -61,6 +61,9 @@ extern "C" long long ragrt_stage3_sparse(const uint8_t* d_map_packed_24, int num
                                          const uint32_t* d_doc_predicates, uint32_t query_mask, long long min_len,
                                          int buf_idx, cudaStream_t stream, int** d_pids, float** d_sums,
                                          long long* n_valid);
+extern "C" long long ragrt_stage3_pidsort(const uint8_t* d_map_packed_24, int num_passages,
+                                          const uint32_t* d_doc_predicates, uint32_t query_mask, long long min_len,
+                                          int buf_idx, cudaStream_t stream, int** d_pids, float** d_sums);
 extern "C" long long ragrt_last_total_postings(int buf_idx);
 extern "C" long long ragrt_stage3_sparse_static(const uint8_t* d_map_packed_24, int num_passages, const uint32_t* d_doc_predicates,
                                                 const uint32_t* d_mask, long long cap, int buf_idx, cudaStream_t stream,
@@ -566,7 +569,22 @@ public:
         if (ev_after_s2) CUDA_CHECK(cudaEventRecord(ev_after_s2, stream));
         auto cand = d_candidate_pids[buf].slice(0, 0, k_candidates);
         auto approx = d_cand_approx[buf].slice(0, 0, k_candidates);
-        if (stage3_sparse) {
+        if (stage3_sparse && ragrt_get_stage3_mode() == 3) {     // pid-only sort: L entries aligned with the postings
+            int* d_pids = nullptr; float* d_sums = nullptr;
+            long long L = ragrt_stage3_pidsort(b_map_packed.data_ptr<uint8_t>(), (int)b_num_passages,
+                                               (const uint32_t*)b_doc_predicates.data_ptr(), query_mask,
+                                               (long long)k_candidates, buf, stream, &d_pids, &d_sums);
+            auto sums = torch::from_blob(d_sums, {L}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+            auto pids = torch::from_blob(d_pids, {L}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+            if (L == k_candidates) {
+                approx.copy_(sums);
+                cand.copy_(pids);
+            } else {
+                auto top = torch::topk(sums, k_candidates);
+                approx.copy_(std::get<0>(top));
+                cand.copy_(pids.index({std::get<1>(top)}));
+            }
+        } else if (stage3_sparse) {
             int* d_pids = nullptr; float* d_sums = nullptr; long long U = 0;
             long long L = ragrt_stage3_sparse(b_map_packed.data_ptr<uint8_t>(), (int)b_num_passages,
                                               (const uint32_t*)b_doc_predicates.data_ptr(), query_mask,
@@ -953,7 +971,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "sparse Stage 3 by hash tables (true) instead of a radix sort (false, default)");
     m.def("get_stage3_hash", []() { return ragrt_get_stage3_hash() != 0; });
     m.def("set_stage3_mode", [](int mode) { ragrt_set_stage3_mode(mode); },
-          "sparse Stage 3: 0 = 64-bit key radix sort (default), 1 = hash tables, 2 = 32-bit key / 16-bit value pair sort");
+          "sparse Stage 3: 0 = 64-bit key radix sort (default), 1 = hash tables, 2 = 32-bit key / 16-bit value pair sort, "
+          "3 = pid-only key sort with a per-passage segment reduce");
     m.def("get_stage3_mode", []() { return ragrt_get_stage3_mode(); });
     m.def("get_rerank_mode", []() { return std::string(ragrt_get_rerank_mode() == 1 ? "wmma" : "simt"); });
     m.def("bruteforce_stage1", &bruteforce_stage1_standalone,

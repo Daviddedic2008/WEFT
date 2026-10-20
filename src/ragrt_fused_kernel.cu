@@ -856,11 +856,12 @@ extern "C" void ragrt_set_codeword_weight(float w) { g_cw_weight = w; }
 extern "C" float ragrt_get_codeword_weight() { return g_cw_weight; }
 
 // Stage 3 implementation for ragrt_stage3_sparse: 0 = 64-bit key radix sort (default),
-// 1 = hash tables, 2 = 32-bit key / 16-bit value pair sort.
+// 1 = hash tables, 2 = 32-bit key / 16-bit value pair sort. 3 = pid-only sort (ragrt_stage3_pidsort,
+// called instead of ragrt_stage3_sparse).
 static int g_stage3_mode = 0;
 extern "C" void ragrt_set_stage3_hash(int on) { g_stage3_mode = on ? 1 : 0; }
 extern "C" int ragrt_get_stage3_hash() { return g_stage3_mode == 1; }
-extern "C" void ragrt_set_stage3_mode(int mode) { g_stage3_mode = (mode >= 0 && mode <= 2) ? mode : 0; }
+extern "C" void ragrt_set_stage3_mode(int mode) { g_stage3_mode = (mode >= 0 && mode <= 3) ? mode : 0; }
 extern "C" int ragrt_get_stage3_mode() { return g_stage3_mode; }
 
 // Compact centroid scores: Stage 2 reads scores[qt * k_cent + c] (only the probed centroids' scores,
@@ -1218,4 +1219,131 @@ extern "C" int ragrt_dropped_task_count(int buf_idx) {
     if (buf_idx < 0 || buf_idx > 1 || !g_b[buf_idx].init) return 0;
     cudaMemcpy(&h, g_b[buf_idx].num_dropped, sizeof(int), cudaMemcpyDeviceToHost);
     return h;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3, pid sort (mode 3; engine weft_pidsort). Same 64-bit keys as the sparse path, but the
+// radix sort covers only the pid bits [SP_PID_SHIFT, end_bit): about half the passes (3 instead
+// of 6 for 22-24 pid bits). Each passage's postings end up contiguous, in task order; the segment
+// kernel takes the max per token and sums the maxima exactly per passage (fp16 values are multiples
+// of 2^-24: an integer sum, rounded once). No reduce-by-key and no count of touched passages, so
+// only one host sync (P, to size the buffers). Output is aligned with the sorted postings: (pid, sum)
+// at each passage's first posting, (-1, -inf) everywhere else.
+// ---------------------------------------------------------------------------
+#define PS_THREADS 256
+
+__device__ __forceinline__ unsigned long long ps_units(unsigned int score_bits) {     // fp16 value in units of 2^-24
+    return (unsigned long long)__float2ull_rz(__half2float(__ushort_as_half((unsigned short)(score_bits & 0x7FFFu))) * 16777216.0f);
+}
+
+// One warp per 32 consecutive sorted postings. Postings of one passage are contiguous (a run); one
+// ballot of the run starts gives every lane its run's bounds. A passage that starts and ends inside
+// the warp is reduced with shuffles (per token, the first posting holding the max counts; the head
+// lane sums them). A passage that runs past the warp's last lane is reduced by the whole warp:
+// 32-wide chunks, per-token max in a shared-memory table, one warp sum. Launch with PS_THREADS
+// threads per block.
+__global__ void pidsort_segments_kernel(
+    const unsigned long long* __restrict__ keys, long long P, long long L, int num_passages,
+    int* __restrict__ pid_out, float* __restrict__ val_out
+) {
+    __shared__ unsigned int s_max[PS_THREADS / 32][32];                // per warp: token -> max score bits
+    const unsigned int FULL = 0xFFFFFFFFu;
+    const int lane = threadIdx.x & 31;
+    unsigned int* tab = s_max[threadIdx.x >> 5];
+    const long long nwarps = ((long long)gridDim.x * blockDim.x) >> 5;
+    for (long long w = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5; w * 32 < L; w += nwarps) {   // warp-uniform
+        const long long i = w * 32 + lane;
+        const bool in = i < P;
+        const unsigned long long k = in ? keys[i] : ~0ULL;
+        // 32-bit group id: the pid (< 2^24), the sentinel run (< 2^25) or 0xFFFFFFFF past P
+        const unsigned int g = (unsigned int)min(k >> SP_PID_SHIFT, 0xFFFFFFFFULL);
+        unsigned int gp = __shfl_up_sync(FULL, g, 1);
+        if (lane == 0) gp = (in && i > 0) ? (unsigned int)min(keys[i - 1] >> SP_PID_SHIFT, 0xFFFFFFFFULL) : 0xFFFFFFFFu;
+        const unsigned int starts = __ballot_sync(FULL, g != gp);      // lanes where a run of equal g begins
+        const bool head = in && g < (unsigned int)num_passages && g != gp;
+        const unsigned int below = starts & (0xFFFFFFFFu >> (31 - lane));                // starts at lanes <= lane
+        const int s0 = below ? 31 - __clz(below) : 0;                  // first lane of this lane's run in the warp
+        const unsigned int after = starts & ~(0xFFFFFFFFu >> (31 - lane));               // starts at lanes > lane
+        const int e0 = after ? __ffs(after) - 1 : 32;                   // one past its last lane in the warp
+        bool c31 = false;                                              // lane 31's run continues past the warp
+        if (lane == 31) c31 = in && i + 1 < P && (unsigned int)min(keys[i + 1] >> SP_PID_SHIFT, 0xFFFFFFFFULL) == g;
+        c31 = __shfl_sync(FULL, c31, 31);
+        const bool cross = head && c31 && e0 == 32;
+        const int len = e0 - lane;                                     // for a head: postings in its run
+        int maxlen = (head && !cross) ? len : 1;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) maxlen = max(maxlen, __shfl_xor_sync(FULL, maxlen, o));
+
+        const unsigned int ts = (unsigned int)(k & 0xFFFFFu);
+        bool win = true;
+        for (int d = 1; d < maxlen; ++d) {
+            unsigned int up = __shfl_down_sync(FULL, ts, d);           // lane + d
+            unsigned int dn = __shfl_up_sync(FULL, ts, d);             // lane - d
+            if (lane + d < e0 && (up >> SP_TOK_SHIFT) == (ts >> SP_TOK_SHIFT) && up > ts) win = false;
+            if (lane - d >= s0 && (dn >> SP_TOK_SHIFT) == (ts >> SP_TOK_SHIFT) && dn >= ts) win = false;
+        }
+        const unsigned long long v = win ? ps_units(ts) : 0ULL;
+        unsigned long long sum = v;
+        for (int d = 1; d < maxlen; ++d) {
+            unsigned long long o = __shfl_down_sync(FULL, v, d);
+            if (d < len) sum += o;
+        }
+        const unsigned int cm = __ballot_sync(FULL, cross);             // at most lane 31's run
+        if (cm) {
+            const int hl = __ffs(cm) - 1;
+            tab[lane] = 0u;
+            __syncwarp();
+            for (long long j = w * 32 + hl + lane; ; j += 32) {
+                unsigned long long kj = j < P ? keys[j] : ~0ULL;
+                bool ok = (unsigned int)min(kj >> SP_PID_SHIFT, 0xFFFFFFFFULL) == __shfl_sync(FULL, g, hl);
+                if (ok) atomicMax(&tab[(kj >> SP_TOK_SHIFT) & 31u], (unsigned int)(kj & 0x7FFFu));
+                if (__ballot_sync(FULL, ok) != FULL) break;          // the run ends in this chunk
+            }
+            __syncwarp();
+            unsigned long long u = ps_units(tab[lane]);
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) u += __shfl_xor_sync(FULL, u, o);
+            if (lane == hl) sum = u;
+            __syncwarp();
+        }
+        if (i < L) {
+            pid_out[i] = head ? (int)g : -1;
+            val_out[i] = head ? __ull2float_rn(sum) * 5.9604644775390625e-8f : -INFINITY;     // x 2^-24
+        }
+    }
+}
+
+// Pid-sort Stage 3. Produces L = max(P, min_len) entries (pid, score) in *d_pids / *d_sums; the
+// caller takes the top-k over them (none needed when L == k). Returns L.
+extern "C" long long ragrt_stage3_pidsort(
+    const uint8_t* d_map_packed_24, int num_passages,
+    const uint32_t* d_doc_predicates, uint32_t query_mask, long long min_len,
+    int buf_idx, cudaStream_t stream, int** d_pids, float** d_sums
+) {
+    Bufs& B = g_b[buf_idx];
+    cudaMemcpyAsync(B.h_total, B.total_postings, sizeof(unsigned long long), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    long long P = (long long)(*B.h_total);
+    long long L = P > min_len ? P : min_len;
+    ensure_sparse(buf_idx, L + 1, stream);
+
+    int pid_bits = 1;
+    while ((1LL << pid_bits) <= (long long)num_passages) ++pid_bits;   // 2^bits - 1 >= N: sentinel pid is invalid
+    int end_bit = SP_PID_SHIFT + pid_bits;
+    unsigned long long sentinel = (end_bit >= 64) ? ~0ULL : ((1ULL << end_bit) - 1ULL);
+    int threads = 256;
+    if (P > 0) {
+        sparse_expand_kernel<<<1024, threads, 0, stream>>>(
+            B.num_tasks, B.task_qt, B.task_offset, B.task_length, B.task_base, B.task_start, P,
+            d_map_packed_24, num_passages, d_doc_predicates, query_mask, sentinel, B.keys_a,
+            g_tok_ids, g_res, (g_tok_ids && g_res) ? g_res_lut : nullptr, nullptr);
+        size_t tb = B.temp_bytes;
+        rcub::DeviceRadixSort::SortKeys(B.temp, tb, B.keys_a, B.keys_b, (int)P, SP_PID_SHIFT, end_bit, stream);
+    }
+    long long blocks = std::min((L + PS_THREADS - 1) / PS_THREADS, 4096LL);
+    pidsort_segments_kernel<<<(unsigned)blocks, PS_THREADS, 0, stream>>>(
+        B.keys_b, P, L, num_passages, B.run_pid_out, B.sums);
+    *d_pids = B.run_pid_out;
+    *d_sums = B.sums;
+    return L;
 }

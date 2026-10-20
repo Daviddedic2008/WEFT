@@ -35,6 +35,9 @@ The three retrieval engines behind one interface, for benchmarks and profiling.
   weft_hash : weft with the hash-table Stage 3 (no radix sort): same scores, less Stage-3 time.
   weft_pairs : weft with the 32-bit-key pair sort in Stage 3 (pid<<5|token keys, fp16 values):
              fewer, narrower radix passes; a reduce-by-key takes the max per (passage, token).
+  weft_pidsort : weft with the pid-only sort in Stage 3: the 64-bit keys sorted on their pid bits only
+             (half the radix passes), then a warp-level segment reduce per passage (max per token, exact
+             sum); no reduce-by-key, one host sync instead of two. Same candidates and scores as weft.
   weft_adapt : weft + adaptive probing under a filter: when the probed centroids' lists hold fewer
              passing postings than an uncorrelated filter would (per-centroid filter-bit counts,
              centroid_bit_counts.npy), probe up to ADAPT_CAP x nc centroids (anti-correlated filters).
@@ -95,9 +98,10 @@ def ragrt_cfg_key(p):
 
 
 IVF_ENGINES = ("weft", "weft_noimpute", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "weft_hash",
-                "weft_adapt", "weft_pairs", "weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip")
+                "weft_adapt", "weft_pairs", "weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip", "weft_pidsort")
 HASH_ENGINES = ("weft_hash",)
 PAIRS_ENGINES = ("weft_pairs",)
+PIDSORT_ENGINES = ("weft_pidsort",)
 ADAPT_ENGINES = ("weft_adapt", "weft_oracle_adapt")   # per-query nc: no batched pipeline
 ORACLE_ENGINES = ("weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip")   # filter-aware prep
 ORACLE_MODE = {"weft_oracle": "oracle", "weft_oracle_adapt": "oracle", "weft_oimp": "oimp", "weft_oskip": "oskip"}
@@ -122,7 +126,7 @@ PREP = {"weft": ("native", True, True, False), "weft_noimpute": ("native", False
         "weft_hash": ("native", True, True, False), "weft_adapt": ("native", True, True, False),
         "weft_pairs": ("native", True, True, False), "weft_oracle": ("native", True, True, False),
         "weft_oracle_adapt": ("native", True, True, False), "weft_oimp": ("native", True, True, False),
-        "weft_oskip": ("native", True, True, False)}
+        "weft_oskip": ("native", True, True, False), "weft_pidsort": ("native", True, True, False)}
 NO_PREP = ("svd96", False, False, False)
 
 
@@ -542,7 +546,8 @@ class Engines:
         rtrag_corr_3d.set_codeword_weight(CODEWORD_WEIGHT[engine])
         self.prep_mode = PREP.get(engine, NO_PREP)
         rtrag_corr_3d.set_compact_scores(self.prep_mode[2])
-        rtrag_corr_3d.set_stage3_mode(2 if engine in PAIRS_ENGINES else (1 if engine in HASH_ENGINES else 0))
+        rtrag_corr_3d.set_stage3_mode(3 if engine in PIDSORT_ENGINES else
+                                      2 if engine in PAIRS_ENGINES else (1 if engine in HASH_ENGINES else 0))
         self.adapt = engine in ADAPT_ENGINES
         self.oracle = ORACLE_MODE.get(engine)
         if not self.prep_mode[3]:
