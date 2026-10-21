@@ -39,6 +39,7 @@ STYLE = {
     "weft_adapt": {"color": "#665191", "marker": "X", "label": "RAGRT, adaptive probing"},
     "weft_pairs": {"color": "#003f5c", "marker": "v", "label": "RAGRT, 32-bit pair sort"},
     "weft_pidsort": {"color": "#2c7fb8", "marker": "8", "label": "RAGRT, pid-only sort Stage 3"},
+    "weft_graph_pidsort": {"color": "#08306b", "marker": "H", "label": "RAGRT, CUDA graphs + pid sort"},
     "weft_oracle": {"color": "#d45087", "marker": "o", "label": "RAGRT, filter-aware (oracle) probing"},
     "weft_oracle_adapt": {"color": "#a05195", "marker": "D", "label": "RAGRT, oracle + adaptive probing"},
     "weft_oimp": {"color": "#f95d6a", "marker": "^", "label": "RAGRT, filter-aware imputation only"},
@@ -46,7 +47,7 @@ STYLE = {
 }
 ALL_ENGINES = ["plaid", "ptms", "plaid_fn", "ptms_fn", "ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf",
                "weft_noimpute", "weft", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "weft_hash", "weft_adapt", "weft_pairs", "weft_pidsort",
-               "weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip", "muvera"]
+               "weft_graph_pidsort", "weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip", "muvera"]
 ENGINES = ALL_ENGINES          # narrowed in main() to the engines present in results.json
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 
@@ -144,6 +145,8 @@ def fig_breakdown(R, out):
                                 ("3 score", r["s3_score"]), ("4 TMS", r["s4_tms"])]))
     if "weft_graph" in b:          # one graph per phase: no per-stage events, total only
         bars.append(("RAGRT, CUDA graphs", [("total (graph)", b["weft_graph"]["total"])]))
+    if "weft_graph_pidsort" in b:
+        bars.append(("RAGRT, graphs + pid sort", [("total (graph)", b["weft_graph_pidsort"]["total"])]))
     if not bars:
         print("  skipping fig_breakdown (no breakdown in this run)")
         return

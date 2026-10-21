@@ -56,7 +56,7 @@ CORE = ["plaid", "ptms", "ragrt"]          # the primary operating point must be
 ENGINES = CORE + ["ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf", "weft_noimpute", "weft",
                   "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph",
                   "weft_hash", "weft_adapt", "weft_pairs", "weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip", "muvera",
-                  "plaid_fn", "ptms_fn", "weft_pidsort"]
+                  "plaid_fn", "ptms_fn", "weft_pidsort", "weft_graph_pidsort"]
 # engines identical to another when unfiltered: the filtered stage runs them at that engine's selected config
 PARAMS_FROM = {"plaid_fn": "plaid", "ptms_fn": "ptms", "weft_oracle": "weft", "weft_oracle_adapt": "weft_adapt", "weft_oimp": "weft", "weft_oskip": "weft"}
 # filtered stage: paired recall@10 differences (b - a, same queries) for these (a, b) when both ran in this run
@@ -92,6 +92,8 @@ ATTRIBUTION = [
     ("ptms", "weft_pairs", "RAGRT (pair sort) vs PLAID+TMS"),
     ("weft", "weft_pidsort", "pid-only sort + segment reduce instead of the full 64-bit key sort"),
     ("ptms", "weft_pidsort", "RAGRT (pid sort) vs PLAID+TMS"),
+    ("weft_graph", "weft_graph_pidsort", "pid-only sort Stage 3 inside the CUDA graph"),
+    ("ptms", "weft_graph_pidsort", "RAGRT (graphs, pid sort) vs PLAID+TMS"),
 ]
 # filter_budget stage: PLAID / PLAID+TMS post-filtering with growing candidate budgets
 FILTER_BUDGETS = [{"ncells": 2, "threshold": 0.45, "ndocs": 1024}, {"ncells": 4, "threshold": 0.4, "ndocs": 4096},
@@ -277,7 +279,7 @@ class Bench:
         grids = {"plaid": plaid_grid, "ptms": plaid_grid, "ragrt": ragrt_grid, "ragrt_bf": ragrt_grid,
                  "ragrt_nofilter": nof, "ragrt_centroid": ragrt_grid, "ragrt_ivf": nof,
                  "weft": nof, "weft_noimpute": nof, "weft_tok": nof, "weft_resid": nof,
-                 "weft_resid_norr": NORR_GRID[:2] if self.args.quick else NORR_GRID, "weft_graph": nof, "weft_hash": nof, "weft_adapt": nof, "weft_pairs": nof, "weft_pidsort": nof,
+                 "weft_resid_norr": NORR_GRID[:2] if self.args.quick else NORR_GRID, "weft_graph": nof, "weft_hash": nof, "weft_adapt": nof, "weft_pairs": nof, "weft_pidsort": nof, "weft_graph_pidsort": nof,
                  "muvera": MUVERA_GRID[:2] if self.args.quick else MUVERA_GRID}
         if PLAID_DEFAULT_K100 not in grids["plaid"]:
             grids["plaid"] = grids["plaid"] + [PLAID_DEFAULT_K100]

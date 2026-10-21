@@ -12,8 +12,9 @@ GPU tests (run on the server after building the extension and the PTX):
 5. Residual scoring on a token-level plain IVF (weft_resid): approximate scores == a torch
    reference of sum_t max over the passage's probed tokens of max(s_tc - m_t + q_t.r, 0);
    compact scores == full scores; LUT off == centroid-only scores.
-6. CUDA-graph path (graph_search.py, engine weft_graph) returns the same results as the eager
-   RAGRT path, with and without a filter, across graph re-use and capacity buckets.
+6. CUDA-graph path (graph_search.py, engines weft_graph and weft_graph_pidsort) returns the same
+   results as the eager RAGRT path, with and without a filter, across graph re-use and capacity
+   buckets, with the 64-bit sort and with the pid-only sort Stage 3 in the graph.
 7. Hash-table Stage 3 (weft_hash), the 32-bit pair sort (weft_pairs) and the pid-only sort
    (weft_pidsort) == the 64-bit radix-sort Stage 3: same touched passages, same scores (up to float
    summation order), with and without a filter, with and without residual scoring.
@@ -442,19 +443,24 @@ def test_graph_path(N=2500, NC=40, E=4, seed=7):
             eager = idx.search_single_query_native(Qf.float(), Qf, Qs, topc, sc, nc, ndocs, 100, mask, E).tolist()
             ok = lambda x: x >= 0 and (mask == 0 or (pred[x] & mask) != 0)
             eager = [x for x in eager if ok(x)]
-            graph = [x for x in gs.search(Qf, ntok, nc, ndocs, E, mask) if ok(x)]
-            if ndocs == N:            # every touched passage is reranked: identical results
-                assert graph == eager, (trial, ntok, nc, mask, graph[:5], eager[:5])
-                same += 1
-            else:                     # ties in the approximate score may pick a different top-ndocs
-                o = len(set(graph) & set(eager)) / max(1, len(eager))
-                assert len(graph) == len(eager) and o >= 0.9, (trial, o)
-                overlap += 1
+            for mode in (0, 3):       # 64-bit sort / pid-only sort Stage 3 in the phase-B graph
+                X.set_stage3_mode(mode)
+                graph = [x for x in gs.search(Qf, ntok, nc, ndocs, E, mask) if ok(x)]
+                if ndocs == N:        # every touched passage is reranked: identical results
+                    assert graph == eager, (mode, trial, ntok, nc, mask, graph[:5], eager[:5])
+                    same += 1
+                else:                 # ties in the approximate score may pick a different top-ndocs
+                    o = len(set(graph) & set(eager)) / max(1, len(eager))
+                    assert len(graph) == len(eager) and o >= 0.9, (mode, trial, o)
+                    overlap += 1
+            X.set_stage3_mode(0)
     finally:
+        X.set_stage3_mode(0)
         X.set_codeword_weight(1.0)
         X.set_compact_scores(False)
         idx.set_stage1_mode(0)
-    print(f"  CUDA-graph path == eager RAGRT on {same} queries (all candidates reranked), >= 90% overlap on {overlap} "
+    print(f"  CUDA-graph path (64-bit and pid-only sort Stage 3) == eager RAGRT on {same} runs (all candidates reranked), "
+          f">= 90% overlap on {overlap} "
           f"(ndocs 256); graphs captured A={gs.stats['captures_a']} B={gs.stats['captures_b']}, replays {gs.stats['replays']}")
 
 

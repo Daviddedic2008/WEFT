@@ -1,5 +1,5 @@
 """
-CUDA-graph execution of the RAGRT pipeline (engine weft_graph in engines.py).
+CUDA-graph execution of the RAGRT pipeline (engines weft_graph and weft_graph_pidsort in engines.py).
 
 Eager RAGRT launches ~60 kernels per query from Python and synchronizes twice inside sparse
 Stage 3 (to size the sort, then to size the reduce output), so on LoTTE the GPU is busy for only
@@ -12,6 +12,8 @@ Stage 3 (to size the sort, then to size the reduce output), so on LoTTE the GPU 
                           (the P keys, then sentinels), top-ndocs, TileMaxSim rerank, filter,
                           top-k. cap is P rounded up to 1/8 of an octave, so at most ~12% of the
                           sorted keys are padding and a handful of graphs cover a whole run.
+                          Stage 3 is the 64-bit key sort, or with Stage 3 mode 3 (weft_graph_pidsort)
+                          the pid-only sort + segment reduce; graphs are cached per mode.
   host:                   .tolist() on the static output        <- the end-of-query sync
 
 Graphs need fixed shapes, so the query is padded to 32 tokens: the padding rows are zero, so
@@ -25,6 +27,7 @@ from collections import OrderedDict
 import numpy as np
 import torch
 
+import rtrag_corr_3d
 from weft_prep import native_prep
 
 MIN_CAP = 1 << 16
@@ -97,7 +100,7 @@ class GraphSearch:
         return self.graphs_a[key][0]
 
     def _phase_b(self, cap, ndocs):
-        key = (cap, ndocs)
+        key = (cap, ndocs, rtrag_corr_3d.get_stage3_mode())    # the mode picks the captured Stage 3 kernels
         if key in self.graphs_b:
             self.graphs_b.move_to_end(key)
             return self.graphs_b[key]

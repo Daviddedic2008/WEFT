@@ -68,6 +68,9 @@ extern "C" long long ragrt_last_total_postings(int buf_idx);
 extern "C" long long ragrt_stage3_sparse_static(const uint8_t* d_map_packed_24, int num_passages, const uint32_t* d_doc_predicates,
                                                 const uint32_t* d_mask, long long cap, int buf_idx, cudaStream_t stream,
                                                 int** d_pids, float** d_sums);
+extern "C" long long ragrt_stage3_pidsort_static(const uint8_t* d_map_packed_24, int num_passages, const uint32_t* d_doc_predicates,
+                                                 const uint32_t* d_mask, long long cap, int buf_idx, cudaStream_t stream,
+                                                 int** d_pids, float** d_sums);
 extern "C" long long ragrt_reserve_sparse(long long cap, int buf_idx, cudaStream_t stream);
 extern "C" long long ragrt_sparse_capacity(int buf_idx);
 extern "C" unsigned long long* ragrt_total_postings_ptr(int buf_idx);
@@ -829,9 +832,11 @@ public:
         TORCH_CHECK(mask_dev.is_cuda() && mask_dev.numel() == 1 && mask_dev.element_size() == 4, "mask_dev: one 32-bit int on the GPU");
         cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
         int* d_pids = nullptr; float* d_sums = nullptr;
-        long long L = ragrt_stage3_sparse_static(b_map_packed.data_ptr<uint8_t>(), (int)b_num_passages,
-                                                 (const uint32_t*)b_doc_predicates.data_ptr(), (const uint32_t*)mask_dev.data_ptr(),
-                                                 cap, 0, stream, &d_pids, &d_sums);
+        // Stage 3 mode at capture time picks the kernels the graph holds: 3 = pid sort, else the 64-bit sort.
+        auto stage3_static = ragrt_get_stage3_mode() == 3 ? ragrt_stage3_pidsort_static : ragrt_stage3_sparse_static;
+        long long L = stage3_static(b_map_packed.data_ptr<uint8_t>(), (int)b_num_passages,
+                                    (const uint32_t*)b_doc_predicates.data_ptr(), (const uint32_t*)mask_dev.data_ptr(),
+                                    cap, 0, stream, &d_pids, &d_sums);
         TORCH_CHECK(L == cap, "sparse capacity ", sparse_capacity(), " < cap ", cap, ": call reserve_static first");
         auto of = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
         auto oi = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);

@@ -38,6 +38,8 @@ The three retrieval engines behind one interface, for benchmarks and profiling.
   weft_pidsort : weft with the pid-only sort in Stage 3: the 64-bit keys sorted on their pid bits only
              (half the radix passes), then a warp-level segment reduce per passage (max per token, exact
              sum); no reduce-by-key, one host sync instead of two. Same candidates and scores as weft.
+  weft_graph_pidsort : weft_graph with the pid-only sort Stage 3 in the phase-B graph
+             (ragrt_stage3_pidsort_static). Same candidates and results as weft_graph.
   weft_adapt : weft + adaptive probing under a filter: when the probed centroids' lists hold fewer
              passing postings than an uncorrelated filter would (per-centroid filter-bit counts,
              centroid_bit_counts.npy), probe up to ADAPT_CAP x nc centroids (anti-correlated filters).
@@ -98,17 +100,18 @@ def ragrt_cfg_key(p):
 
 
 IVF_ENGINES = ("weft", "weft_noimpute", "weft_tok", "weft_resid", "weft_resid_norr", "weft_graph", "weft_hash",
-                "weft_adapt", "weft_pairs", "weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip", "weft_pidsort")
+                "weft_adapt", "weft_pairs", "weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip", "weft_pidsort",
+                "weft_graph_pidsort")
 HASH_ENGINES = ("weft_hash",)
 PAIRS_ENGINES = ("weft_pairs",)
-PIDSORT_ENGINES = ("weft_pidsort",)
+PIDSORT_ENGINES = ("weft_pidsort", "weft_graph_pidsort")
 ADAPT_ENGINES = ("weft_adapt", "weft_oracle_adapt")   # per-query nc: no batched pipeline
 ORACLE_ENGINES = ("weft_oracle", "weft_oracle_adapt", "weft_oimp", "weft_oskip")   # filter-aware prep
 ORACLE_MODE = {"weft_oracle": "oracle", "weft_oracle_adapt": "oracle", "weft_oimp": "oimp", "weft_oskip": "oskip"}
 ADAPT_CAP = 8                            # probe at most ADAPT_CAP x nc centroids
 ADAPT_Q = 0.75                           # quantile of the tokens' needed nc (1.0 = max)
 ADAPT_SLACK = 0.5                        # token is starved below this share of the uncorrelated count
-GRAPH_ENGINES = ("weft_graph",)          # CUDA-graph path: no per-stage profile, no batched pipeline
+GRAPH_ENGINES = ("weft_graph", "weft_graph_pidsort")    # CUDA-graph path: no per-stage profile, no batched pipeline
 RESID_ENGINES = ("weft_resid", "weft_resid_norr")       # need a token-level index (csr_token_ids.npy)
 TOKEN_ENGINES = ("weft_tok",) + RESID_ENGINES
 RAGRT_ENGINES = ("ragrt", "ragrt_bf", "ragrt_nofilter", "ragrt_centroid", "ragrt_ivf") + IVF_ENGINES
@@ -126,7 +129,8 @@ PREP = {"weft": ("native", True, True, False), "weft_noimpute": ("native", False
         "weft_hash": ("native", True, True, False), "weft_adapt": ("native", True, True, False),
         "weft_pairs": ("native", True, True, False), "weft_oracle": ("native", True, True, False),
         "weft_oracle_adapt": ("native", True, True, False), "weft_oimp": ("native", True, True, False),
-        "weft_oskip": ("native", True, True, False), "weft_pidsort": ("native", True, True, False)}
+        "weft_oskip": ("native", True, True, False), "weft_pidsort": ("native", True, True, False),
+        "weft_graph_pidsort": ("native", True, True, False)}
 NO_PREP = ("svd96", False, False, False)
 
 
@@ -656,7 +660,7 @@ class Engines:
             try:
                 if engine == "weft_resid_norr":
                     return self.approx_topk(Qf, ntok, self.resolve(engine, p), mask)
-                if engine == "weft_graph":
+                if engine in GRAPH_ENGINES:
                     return self.graph_search(Qf, ntok, self.resolve(engine, p), mask)
                 return self.ragrt(Qf, ntok, self.resolve(engine, p), mask)
             finally:

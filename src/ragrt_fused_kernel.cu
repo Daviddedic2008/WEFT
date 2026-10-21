@@ -1347,3 +1347,34 @@ extern "C" long long ragrt_stage3_pidsort(
     *d_sums = B.sums;
     return L;
 }
+
+// Pid-sort Stage 3 with NO host synchronization (CUDA graph path, engine weft_graph_pidsort): the
+// same fixed-capacity keys as ragrt_stage3_sparse_static (P real ones, then sentinels), sorted on
+// the pid bits only. Sentinels (and filtered postings) carry pid 2^pid_bits - 1 >= N, so they sort
+// last and the segment kernel writes (-1, -inf) for them. Produces cap entries aligned with the
+// sorted keys, as ragrt_stage3_pidsort does; returns cap (-1 if cap exceeds the reserved capacity).
+extern "C" long long ragrt_stage3_pidsort_static(
+    const uint8_t* d_map_packed_24, int num_passages, const uint32_t* d_doc_predicates,
+    const uint32_t* d_mask, long long cap, int buf_idx, cudaStream_t stream, int** d_pids, float** d_sums
+) {
+    Bufs& B = g_b[buf_idx];
+    if (!B.init || cap > B.sp_cap || cap <= 0) return -1;
+    int pid_bits = 1;
+    while ((1LL << pid_bits) <= (long long)num_passages) ++pid_bits;
+    int end_bit = SP_PID_SHIFT + pid_bits;
+    unsigned long long sentinel = (end_bit >= 64) ? ~0ULL : ((1ULL << end_bit) - 1ULL);
+    int threads = 256;
+    sparse_fill_sentinel_kernel<<<256, threads, 0, stream>>>(B.total_postings, cap, sentinel, B.keys_a);
+    sparse_expand_kernel<<<1024, threads, 0, stream>>>(
+        B.num_tasks, B.task_qt, B.task_offset, B.task_length, B.task_base, B.task_start, cap,
+        d_map_packed_24, num_passages, d_doc_predicates, 0u, sentinel, B.keys_a,
+        g_tok_ids, g_res, (g_tok_ids && g_res) ? g_res_lut : nullptr, d_mask);
+    size_t tb = B.temp_bytes;
+    rcub::DeviceRadixSort::SortKeys(B.temp, tb, B.keys_a, B.keys_b, (int)cap, SP_PID_SHIFT, end_bit, stream);
+    long long blocks = std::min((cap + PS_THREADS - 1) / PS_THREADS, 4096LL);
+    pidsort_segments_kernel<<<(unsigned)blocks, PS_THREADS, 0, stream>>>(
+        B.keys_b, cap, cap, num_passages, B.run_pid_out, B.sums);
+    *d_pids = B.run_pid_out;
+    *d_sums = B.sums;
+    return cap;
+}
